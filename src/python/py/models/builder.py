@@ -3,12 +3,13 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
+# Modifications Copyright(C) 2024 Advanced Micro Devices, Inc. All rights reserved
 """
 Run this script to create the desired ONNX model.
 """
 
 from onnx import helper, numpy_helper, TensorProto, external_data_helper, save_model
-from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer
+from onnxruntime.quantization.matmul_4bits_quantizer import MatMul4BitsQuantizer, QuantFormat
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import numpy as np
 import torch
@@ -21,16 +22,16 @@ import textwrap
 
 
 class Model:
-    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
-        self.context_length = config.max_position_embeddings
-        self.original_context_length = config.original_max_position_embeddings if hasattr(config, "original_max_position_embeddings") else config.rope_scaling["original_max_position_embeddings"] if hasattr(config, "rope_scaling") and hasattr(config.rope_scaling, "original_max_position_embeddings") else config.max_position_embeddings
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options): 
+        self.context_length = config.seq_length if hasattr(config, "seq_length") else config.max_position_embeddings
+        self.original_context_length = config.original_max_position_embeddings if hasattr(config, "original_max_position_embeddings") else config.rope_scaling["original_max_position_embeddings"] if hasattr(config, "rope_scaling") and hasattr(config.rope_scaling, "original_max_position_embeddings") else self.context_length
         self.window_size = config.sliding_window if hasattr(config, "sliding_window") else -1  # default is -1 in GroupQueryAttention kernel
-        self.intermediate_size = config.intermediate_size
+        self.intermediate_size = config.ffn_hidden_size if hasattr(config, "ffn_hidden_size") else config.intermediate_size
         self.hidden_size = config.hidden_size
-        self.num_kv_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads if hasattr(config, "num_key_value_heads") else config.multi_query_group_num if hasattr(config, "multi_query_group_num") else config.num_attention_heads
         self.num_attn_heads = config.num_attention_heads
         self.head_size = config.head_dim if hasattr(config, "head_dim") else config.hidden_size // config.num_attention_heads
-        self.num_layers = int(extra_options["num_hidden_layers"]) if "num_hidden_layers" in extra_options else config.num_hidden_layers
+        self.num_layers = int(extra_options["num_hidden_layers"]) if "num_hidden_layers" in extra_options else config.num_hidden_layers if hasattr(config, "num_hidden_layers") else config.num_layers
         self.vocab_size = config.vocab_size
         self.activation = config.hidden_activation if hasattr(config, "hidden_activation") and config.hidden_activation is not None else config.hidden_act
 
@@ -38,10 +39,12 @@ class Model:
         self.model_type = config.architectures[0]
         self.io_dtype = io_dtype      # {'fp16', 'fp32'}
         self.onnx_dtype = onnx_dtype  # {"int4", "fp16", "fp32"}
+        self.use_qdq = extra_options.get("use_qdq", False)
         self.quant_type = config.quantization_config["quant_method"] if hasattr(config, "quantization_config") else None
 
         self.cache_dir = cache_dir
         self.filename = extra_options["filename"] if "filename" in extra_options else "model.onnx"
+        self.hf_token = parse_hf_token(extra_options.get("hf_token", "true"))
         self.extra_options = extra_options
 
         self.inputs = []
@@ -225,6 +228,7 @@ class Model:
         valid_gqa_configurations = [
             ("cpu", TensorProto.FLOAT),
             ("cuda", TensorProto.FLOAT16),
+            ("rocm", TensorProto.FLOAT16),
             ("dml", TensorProto.FLOAT16),
         ]
         if (self.ep, self.io_dtype) in valid_gqa_configurations:
@@ -275,7 +279,7 @@ class Model:
         self.quant_attrs = {
             "int4": {
                 "block_size": int(extra_options["int4_block_size"]) if "int4_block_size" in extra_options else 32,
-                "accuracy_level": int(extra_options["int4_accuracy_level"]) if "int4_accuracy_level" in extra_options else None,
+                "accuracy_level": int(extra_options["int4_accuracy_level"]) if "int4_accuracy_level" in extra_options else 0,   # Default is 0 for non-QDQ formats, default is 4 for QDQ formats
             }
         }
         if self.quant_type is not None:
@@ -286,9 +290,9 @@ class Model:
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
         try:
-            config = GenerationConfig.from_pretrained(model_name_or_path, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+            config = GenerationConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
         except:
-            config = AutoConfig.from_pretrained(model_name_or_path, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+            config = AutoConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
         inputs = dict(zip(self.input_names, self.input_names))
         inputs.update({
             "past_key_names": "past_key_values.%d.key",
@@ -296,7 +300,7 @@ class Model:
         })
         genai_config = {
             "model": {
-                "bos_token_id": config.bos_token_id,
+                "bos_token_id": config.bos_token_id if hasattr(config, "bos_token_id") else 1,  # config.bos_token_id not present in ChatGLM model configs.
                 "context_length": self.context_length,
                 "decoder": {
                     "session_options" : {
@@ -348,7 +352,7 @@ class Model:
             json.dump(genai_config, f, indent=4)
 
     def save_processing(self, model_name_or_path, extra_kwargs, out_dir):
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
         print(f"Saving processing files in {out_dir} for GenAI")
         tokenizer.save_pretrained(out_dir)
 
@@ -358,7 +362,7 @@ class Model:
 
         # Create ONNX model
         model = helper.make_model(
-            opset_imports=[self.clear_field(helper.make_operatorsetid('', 14), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
+            opset_imports=[self.clear_field(helper.make_operatorsetid('', 21 if self.use_qdq else 14), 'domain'), helper.make_operatorsetid('com.microsoft', 1)],
             ir_version=7,
             producer_name="onnxruntime-genai",
             producer_version="0.0.0",
@@ -416,6 +420,7 @@ class Model:
             is_symmetric=True,
             accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
             nodes_to_exclude=[],
+            quant_format=QuantFormat.QDQ if self.use_qdq else QuantFormat.QOperator,
         )
         quant.process()
         return quant.model.model
@@ -428,7 +433,7 @@ class Model:
         order = list(order)
         repeated_proto.sort(key=lambda x: order.index(getattr(x, key_name)))
 
-    def make_external_tensor(self, np_data, name, **kwargs):
+    def make_external_tensor(self, np_data, name, unpack_int4=False, **kwargs):
         tensor = numpy_helper.from_array(np_data)
         tensor.name = name
 
@@ -438,6 +443,10 @@ class Model:
             f.write(tensor.raw_data)
         tensor.ClearField("raw_data")
         tensor.data_location = TensorProto.EXTERNAL
+
+        if unpack_int4 and self.onnx_dtype == 'int4':
+            tensor.data_type = TensorProto.UINT4
+            tensor.dims[-1] *= 2
 
         self.initializers.append(tensor)
 
@@ -570,6 +579,11 @@ class Model:
         output = f"{name}/output_0"
         self.make_node("Greater", inputs=inputs, outputs=[output], name=name)
         self.make_value_info(output, TensorProto.BOOL, shape=shape)
+    
+    def make_greater_or_equal(self, name, inputs, shape):
+        output = f"{name}/output_0"
+        self.make_node("GreaterOrEqual", inputs=inputs, outputs=[output], name=name)
+        self.make_value_info(output, TensorProto.BOOL, shape=shape)
 
     def make_isinf(self, name, root_input, shape):
         output = f"{name}/output_0"
@@ -594,6 +608,11 @@ class Model:
     def make_reduce_sum(self, name, inputs, dtype, shape):
         output = f"{name}/output_0"
         self.make_node("ReduceSum", inputs=inputs, outputs=[output], name=name)
+        self.make_value_info(output, dtype, shape=shape)
+
+    def make_reduce_max(self, name, inputs, dtype, shape):
+        output = f"{name}/output_0"
+        self.make_node("ReduceMax", inputs=inputs, outputs=[output], name=name, keepdims=False)
         self.make_value_info(output, dtype, shape=shape)
 
     def make_cast(self, name, root_input, dtype, shape):
@@ -650,7 +669,10 @@ class Model:
         if self.onnx_dtype in {"fp16", "fp32"}:
             return self.make_matmul_fp16_or_fp32(matmul, basename, root_input, **kwargs)
         elif self.onnx_dtype == "int4":
-            return self.make_matmul_int4(matmul, basename, root_input, **kwargs)
+            if self.use_qdq:
+                return self.make_matmul_int4_qdq(matmul, basename, root_input, **kwargs)
+            else:
+                return self.make_matmul_int4(matmul, basename, root_input, **kwargs)
         else:
             raise NotImplementedError(f"The {self.onnx_dtype} precision is not currently supported.")
 
@@ -695,11 +717,63 @@ class Model:
         output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
         self.make_node(
             "MatMulNBits", inputs=inputs, outputs=[output], name=name, domain="com.microsoft",
+            accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
             bits=matmul.bits, block_size=matmul.group_size, K=matmul.in_features, N=matmul.out_features,
         )
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', matmul.out_features])
 
         return name
+
+    def make_dequantize_linear(self, dequantize_name, quantized_op):
+        # Input weights are quantized, save quantized MatMul numpy weights for onnx model
+        qweight = dequantize_name[1:].replace("/", ".") + ".qweight"
+        qweight_npy = quantized_op.qweight.detach().numpy()
+        qweight_npy = qweight_npy.reshape(*qweight_npy.shape[:-2], qweight_npy.shape[-2] * qweight_npy.shape[-1])
+        self.make_external_tensor(qweight_npy, qweight, True)
+
+        scales = dequantize_name[1:].replace("/", ".") + ".scales"
+        scales_npy = quantized_op.scales.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype])
+        scales_npy = scales_npy.reshape(*qweight_npy.shape[:-1], qweight_npy.shape[-1] * 2 // quantized_op.group_size)
+        self.make_external_tensor(scales_npy, scales)
+
+        dequantize_inputs = [qweight, scales]
+
+        if hasattr(quantized_op, "qzeros") and quantized_op.qzeros is not None:
+            zeros = dequantize_name[1:].replace("/", ".") + ".qzeros"
+            zeros_npy = quantized_op.qzeros.detach().numpy()
+            zeros_npy = zeros_npy.reshape(*qweight_npy.shape[:-1], qweight_npy.shape[-1] // quantized_op.group_size)
+            self.make_external_tensor(zeros_npy, zeros, True)
+            dequantize_inputs.append(zeros)
+
+        dequantize_output = f"{dequantize_name}/output_0"
+        self.make_node("DequantizeLinear", inputs=dequantize_inputs, outputs=[dequantize_output], name=dequantize_name, block_size=quantized_op.group_size, axis=-1)
+        self.make_value_info(dequantize_output, self.io_dtype, shape=[*scales_npy.shape[:-1], scales_npy.shape[-1] * quantized_op.group_size])
+
+        return dequantize_output
+
+    def make_matmul_int4_qdq(self, matmul, matmul_name, root_input, **kwargs):
+        if not hasattr(matmul, "qweight"):
+            # TODO: quantize weights, then save new MatMul numpy weights for onnx model
+            # print(f"Quantizing to {self.onnx_dtype} on-the-fly is not currently supported.")
+            # print(f"Saving as {self.io_dtype} on-the-fly and quantizing to {self.onnx_dtype} at the end.")
+            return self.make_matmul_fp16_or_fp32(matmul, matmul_name, root_input, **kwargs)
+
+        dequantize_output = self.make_dequantize_linear(f"{matmul_name}/DequantizeLinear", matmul)
+
+        # Add a transpose instead of transposing the weights offline. The reason for this is that it is more natural and usually more performant to
+        # compute quantized matmul when the weights are transposed. In most implementations, the transpose should usually be converted to a "transposeB"
+        # attribute on the MatMul itself. A more natural way to represent this would have been to use Gemm since it already supports a transB attribute,
+        # but unfortunately Gemm doesn't support batches.
+        qweight_shape = matmul.qweight.detach().numpy().shape
+        transposed_shape = [qweight_shape[1] * qweight_shape[2] * 2, qweight_shape[0]]
+        transpose_name = f"{matmul_name}/Transpose"
+        self.make_transpose(transpose_name, dequantize_output, self.io_dtype, transposed_shape, [1, 0])
+
+        matmul_output = "logits" if kwargs.get("logits", False) else f"{matmul_name}/output_0"
+        self.make_node("MatMul", inputs=[root_input, f"{transpose_name}/output_0"], outputs=[matmul_output], name=matmul_name)
+        self.make_value_info(matmul_output, self.io_dtype, shape=['batch_size', 'sequence_length', matmul.out_features])
+
+        return matmul_name
 
     def make_packed_matmul(self, q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs):
         if self.onnx_dtype in {"fp16", "fp32"}:
@@ -770,6 +844,7 @@ class Model:
         output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
         self.make_node(
             "MatMulNBits", inputs=inputs, outputs=[output], name=name, domain="com.microsoft",
+            accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
             bits=matmul.bits, block_size=matmul.group_size, K=matmul.in_features, N=matmul.out_features,
         )
         self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', matmul.out_features])
@@ -1430,14 +1505,15 @@ class Model:
             raise NotImplementedError(f"The MLP layer type is not set.")
 
     def make_mlp_unpacked(self, layer_id, mlp, root_input):
+        packed_proj = getattr(mlp, "gate_up_proj", None) or getattr(mlp, "dense_h_to_4h", None)
         mlp.gate_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=self.intermediate_size)
-        mlp.gate_proj.weight = torch.nn.Parameter(mlp.gate_up_proj.weight[ : self.intermediate_size, :])
+        mlp.gate_proj.weight = torch.nn.Parameter(packed_proj.weight[: self.intermediate_size, :])
 
         mlp.up_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=self.intermediate_size)
-        mlp.up_proj.weight = torch.nn.Parameter(mlp.gate_up_proj.weight[self.intermediate_size :, :])
+        mlp.up_proj.weight = torch.nn.Parameter(packed_proj.weight[self.intermediate_size :, :])
 
         # Delete original packed weights
-        del mlp.gate_up_proj
+        del packed_proj
 
     def make_mlp_proj(self, layer_id, mlp, root_input):
         # Make nodes for the MLP subgraph
@@ -1467,8 +1543,9 @@ class Model:
         self.make_mul(mul_name, mul_inputs, dtype=self.io_dtype, shape=["batch_size", "sequence_length", self.intermediate_size])
 
         # Make output MatMul node
+        down_proj = getattr(mlp, "down_proj", None) or getattr(mlp, "dense_4h_to_h", None)
         down_basename = f"/model/layers.{layer_id}/mlp/down_proj/MatMul"
-        down_name = self.make_matmul(mlp.down_proj, down_basename, f"{mul_name}/output_0")
+        down_name = self.make_matmul(down_proj, down_basename, f"{mul_name}/output_0")
 
         # Assign output 0 of previous MatMul as skip input to next SkipLayerNorm
         self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
@@ -1661,8 +1738,24 @@ class Model:
 
         return gelu_name
 
+    def make_relu(self, layer_id, root_input, activation):
+        relu_name = f"/model/layers.{layer_id}/mlp/act_fn/{activation}"
+        output = f"{relu_name}/output_0"
+        self.make_node(activation, inputs=[root_input], outputs=[output], name=relu_name, domain="")
+        self.make_value_info(output, self.io_dtype, shape=['batch_size', 'sequence_length', self.intermediate_size])
+        return relu_name
+
+    def make_relu_squared(self, layer_id, root_input, activation):
+        relu_name = self.make_relu(layer_id, root_input, "Relu")
+        basename = f"/model/layers.{layer_id}/mlp/square/{activation}"
+        pow_name = f"{basename}/pow"
+        pow_inputs = [f"{relu_name}/output_0", "/model/constants/TensorProto.INT32/1D/2"]
+        self.make_node("Pow", inputs=pow_inputs, outputs=[f"{pow_name}/output_0"], name=pow_name, domain="")
+        self.make_value_info(f"{pow_name}/output_0", self.io_dtype, shape=['batch_size', 'sequence_length', self.intermediate_size])
+        return pow_name
+
     def make_activation(self, layer_id, root_input):
-        if self.activation in {"silu", "swish"}:
+        if self.activation in {"silu", "swish", "swiglu"}:
             output_name = self.make_activation_with_mul(layer_id, root_input, activation="Sigmoid", domain=None)
         elif self.activation in {"gelu_new", "gelu_fast", "gelu_pytorch_tanh"}:
             output_name = self.make_gelu(layer_id, root_input, activation="FastGelu")
@@ -1670,6 +1763,10 @@ class Model:
             output_name = self.make_gelu(layer_id, root_input, activation="Gelu")
         elif self.activation in {"gegelu", "geglu"}:
             output_name = self.make_gelu(layer_id, root_input, activation="QuickGelu")
+        elif self.activation in {"relu"}:
+            output_name = self.make_relu(layer_id, root_input, activation="Relu")
+        elif self.activation in {"relu2"}:
+            output_name = self.make_relu_squared(layer_id, root_input, activation="Relu2")
         else:
             raise NotImplementedError(f"The {self.activation} activation function is not currently supported.")
         return output_name
@@ -1742,15 +1839,26 @@ class Model:
                 from onnxruntime_genai.models.quantized_model import QuantModel
             q_size = self.num_attn_heads * self.head_size
             kv_size = self.num_kv_heads * self.head_size
-            model = QuantModel.from_pretrained(self.quant_type, input_path, self.quant_attrs["bits"], self.quant_attrs["group_size"], self.quant_attrs["use_g_idx"], q_size, kv_size, self.intermediate_size, self.num_layers)
+            model = QuantModel.from_pretrained(
+                self.quant_type,
+                input_path,
+                self.quant_attrs["bits"],
+                self.quant_attrs["group_size"],
+                self.quant_attrs["use_g_idx"],
+                q_size,
+                kv_size,
+                self.intermediate_size,
+                self.num_layers,
+            )
         else:
             # Load PyTorch model
             extra_kwargs = {"num_hidden_layers": self.num_layers} if "num_hidden_layers" in self.extra_options else {}
-            model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, cache_dir=self.cache_dir, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+            model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, cache_dir=self.cache_dir, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
 
         # Loop through model and map each module to ONNX/ORT ops
         self.layer_id = 0
         for module in model.modules():
+
             if isinstance(module, torch.nn.Embedding) or (hasattr(model, "embedding") and module == model.embedding):
                 # Checks (Hugging Face logic) or (GGUF logic)
                 if not self.exclude_embeds:
@@ -1762,7 +1870,7 @@ class Model:
                     self.layernorm_attrs["root_input"] = "inputs_embeds"
                     self.layernorm_attrs["skip_input"] = "inputs_embeds"
 
-            elif module.__class__.__name__.endswith("DecoderLayer") and self.layer_id < self.num_layers:
+            elif (module.__class__.__name__.endswith("DecoderLayer") or module.__class__.__name__.endswith("GLMBlock")) and self.layer_id < self.num_layers:
                 # Each decoder layer of model
                 print(f"Reading decoder layer {self.layer_id}")
                 self.make_layer(self.layer_id, module)
@@ -1772,7 +1880,7 @@ class Model:
                 # SkipLayerNorm after last decoder layer (MatMul --> SkipLayerNorm)
                 print("Reading final norm")
                 self.make_layernorm(self.layer_id, module, skip=True, simple=self.layernorm_attrs["simple"], location="final_norm")
-
+            
             elif (isinstance(module, torch.nn.Linear) and module.out_features == self.vocab_size) or (hasattr(model, "lm_head") and module == model.lm_head):
                 # Checks (Hugging Face logic) or (GGUF logic)
                 if not self.exclude_lm_head:
@@ -1783,12 +1891,13 @@ class Model:
         del model
 
     def has_final_norm(self, module, model):
-        # Hugging Face names
-        hf_norm = hasattr(model, "model") and hasattr(model.model, "norm") and module == model.model.norm
-        hf_final_layernorm = hasattr(model, "model") and hasattr(model.model, "final_layernorm") and module == model.model.final_layernorm
-        # GGUF names
-        gguf_final_norm = hasattr(model, "final_norm") and module == model.final_norm
-        return hf_norm or hf_final_layernorm or gguf_final_norm
+       # Hugging Face names
+       hf_norm = hasattr(model, "model") and hasattr(model.model, "norm") and module == model.model.norm
+       hf_final_layernorm = hasattr(model, "model") and hasattr(model.model, "final_layernorm") and module == model.model.final_layernorm
+       hf_transformer_final_layernorm = hasattr(model, "transformer") and hasattr(model.transformer, "encoder") and hasattr(model.transformer.encoder, "final_layernorm") and module == model.transformer.encoder.final_layernorm
+       # GGUF names
+       gguf_final_norm = hasattr(model, "final_norm") and module == model.final_norm
+       return hf_norm or hf_final_layernorm or hf_transformer_final_layernorm or gguf_final_norm
 
     def make_preprocessing_nodes(self):
         self.make_attention_mask_reformatting()
@@ -2212,6 +2321,7 @@ class Model:
         #      position_ids input for RotaryEmbedding
 
         basename = "/model/pos_ids_reformat"
+
         shape_name = f"{basename}/Shape"
         self.make_shape(shape_name, root_input="input_ids" if not self.exclude_embeds else "inputs_embeds", shape=[2] if not self.exclude_embeds else [3])
         gather_name = f"{basename}/Gather"
@@ -2364,12 +2474,112 @@ class Phi3Mini4KModel(MistralModel):
             super().make_mlp_unpacked(layer_id, mlp, root_input)
         super().make_mlp_proj(layer_id, mlp, root_input)
 
+class NemotronModel(LlamaModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.layernorm_attrs["simple"] = False
+        self.layernorm_attrs["add_offset"] = 1
+        self.rotemb_attrs["rotary_embedding_dim"] = int(self.head_size * self.rotemb_attrs["partial_rotary_factor"])
+
+    def make_mlp_proj(self, layer_id, mlp, root_input):
+        # Make nodes for the MLP subgraph
+        #
+        #          root_input
+        #              |
+        #         UpProjMatMul
+        #              |
+        #           ActFunc
+        #              |
+        #         DownProjMatMul
+
+        up_basename = f"/model/layers.{layer_id}/mlp/up_proj/MatMul"
+        up_name = self.make_matmul(mlp.up_proj, up_basename, root_input)
+
+        act_fn_name = self.make_activation(layer_id, root_input=f"{up_name}/output_0")
+
+        # Make output MatMul node
+        down_basename = f"/model/layers.{layer_id}/mlp/down_proj/MatMul"
+        down_name = self.make_matmul(mlp.down_proj, down_basename, f"{act_fn_name}/output_0")
+
+        # Assign output 0 of previous MatMul as skip input to next SkipLayerNorm
+        self.layernorm_attrs["skip_input"] = f"{down_name}/output_0"
+
+    def make_attention(self, layer_id, attention, root_input, **kwargs):
+        attention.rotary_emb = type("RotaryEmbedding", (object,), {'content':{}})()
+        return super().make_attention(layer_id, attention, root_input, **kwargs)
+
+    def make_rotary_embedding(self, rotemb, name, root_input, **kwargs):
+        num_heads = self.num_kv_heads if "k_rotary" in name else self.num_attn_heads
+        super().make_rotary_embedding(rotemb, name, root_input, num_heads=num_heads, rotary_embedding_dim=self.rotemb_attrs["rotary_embedding_dim"], **kwargs)
 
 class Phi3Mini128KModel(Phi3Mini4KModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
         self.make_rotary_embedding_multi_cache()
+   
+    def make_position_ids_reformatting(self):
+        if self.ep != "dml":
+            position_ids_input_to_rotemb = super().make_position_ids_reformatting()
+            return position_ids_input_to_rotemb
 
+        basename = "/model/pos_ids_reformat"
+        reduce_max_name = f"{basename}/ReduceMax"
+        reduce_max_inputs = ["position_ids"]
+        self.make_reduce_max(reduce_max_name, reduce_max_inputs, dtype=TensorProto.INT64, shape=[1])
+        greater_or_equal_name = f"{basename}/GreaterOrEqual"
+        greater_or_equal_inputs = [f"{reduce_max_name}/output_0", f"/model/constants/TensorProto.INT64/0D/{self.original_context_length}"]
+        self.make_greater_or_equal(greater_or_equal_name, greater_or_equal_inputs, shape=[])
+        cast_name = f"{basename}/Cast"
+        self.make_cast(cast_name, f"{greater_or_equal_name}/output_0", dtype=TensorProto.INT64, shape=None)
+        mul_name = f"{basename}/Mul"
+        mul_inputs = [f"{cast_name}/output_0", f"/model/constants/TensorProto.INT64/0D/{self.original_context_length}"]
+        self.make_mul(mul_name, mul_inputs, dtype=TensorProto.INT64, shape=None)
+        add_1_name = f"{basename}/Add_1"
+        add_1_inputs = [f"{mul_name}/output_0", "position_ids"]
+        self.make_add(add_1_name, add_1_inputs, dtype=TensorProto.INT64, shape=["batch_size", "sequence_length"])
+
+        return add_1_name
+        
+    def make_rotary_embedding_caches(self, rotemb, **kwargs):
+        if self.ep != "dml":
+            cos_cache_name, sin_cache_name = super().make_rotary_embedding_caches(rotemb, **kwargs)
+            return cos_cache_name, sin_cache_name
+
+        cos_cache_name = kwargs.get("cos_cache_name", "cos_cache")
+        sin_cache_name = kwargs.get("sin_cache_name", "sin_cache")
+
+        if self.rotemb_attrs["create_rotary_embedding_caches"]:
+            if not hasattr(rotemb, "cos_cached"):
+                # Create cos/sin caches if not already created
+                # concate 4k and 128k cos/sin caches for phi3/phi3.5 and dml EP only
+                cos_cache_large, sin_cache_large = self.make_rotary_embedding_caches_from_scratch()
+                self.rotemb_attrs["rescale_factors"] = self.rotemb_attrs["multi_cache"]["short_factor"]
+                self.rotemb_attrs["cache_length"] = self.original_context_length
+                self.rotemb_attrs["mscale"] = self.rotemb_attrs["multi_cache"]["short_mscale"]
+                cos_cache_small, sin_cache_small = self.make_rotary_embedding_caches_from_scratch()
+                cos_cache = torch.cat((cos_cache_small, cos_cache_large), dim=0)
+                sin_cache = torch.cat((sin_cache_small, sin_cache_large), dim=0)
+            else:
+                cos_cache, sin_cache = rotemb.cos_cached, rotemb.sin_cached
+
+            # Reshape cos/sin cache from (M, H) to (M, H/2)
+            hidden_dim = cos_cache.shape[-1]
+            cos_cache = cos_cache.squeeze()[:, : (hidden_dim // 2)].detach().numpy()
+            cos_cache = cos_cache.astype(self.to_numpy_dtype[self.io_dtype])
+            sin_cache = sin_cache.squeeze()[:, : (hidden_dim // 2)].detach().numpy()
+            sin_cache = sin_cache.astype(self.to_numpy_dtype[self.io_dtype])
+
+            if "cos_cache_name" not in kwargs and "sin_cache_name" not in kwargs:
+                # Save cos/sin caches to disk
+                self.make_external_tensor(cos_cache, cos_cache_name)
+                self.make_external_tensor(sin_cache, sin_cache_name)
+            else:
+                # Return cos/sin caches since they will be custom-saved
+                return cos_cache, sin_cache
+
+            self.rotemb_attrs["create_rotary_embedding_caches"] = False
+
+        return cos_cache_name, sin_cache_name
 
 class Phi3Small8KModel(Model):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
@@ -2611,6 +2821,34 @@ class Phi3MoE128KModel(MistralModel):
             self.layernorm_attrs["last_layernorm"] = True
 
 
+class ChatGLMModel(Model):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        self.rotemb_attrs["num_heads"] = self.num_attn_heads
+        self.rotemb_attrs["partial_rotary_factor"] = 0.5 # Line 755 of modeling_chatglm.py check self.rotary_pos_emb declaration
+        self.rotemb_attrs["rotary_embedding_dim"] = int(self.head_size * self.rotemb_attrs["partial_rotary_factor"])
+        self.rotemb_attrs["interleaved"] = 1
+
+    def make_rotary_embedding(self, rotemb, name, root_input, **kwargs):
+        super().make_rotary_embedding(rotemb, name, root_input, num_heads=self.rotemb_attrs["num_heads"], rotary_embedding_dim=self.rotemb_attrs["rotary_embedding_dim"], **kwargs)
+
+    def make_attention(self, layer_id, attention, root_input, **kwargs):
+        if self.quant_type is None:
+            super().make_attention_unpacked(layer_id, attention, root_input, **kwargs)
+            # Add dummy rotary_emb attribute
+            attention.rotary_emb = type("RotaryEmbedding", (object,), {'content':{}})()
+        return super().make_attention(layer_id, attention, root_input, **kwargs)
+
+
+    def make_mlp_proj(self, layer_id, mlp, root_input):
+        if self.quant_type is None:
+            super().make_mlp_unpacked(layer_id, mlp, root_input)
+        super().make_mlp_proj(layer_id, mlp, root_input)
+
+    def make_layer(self, layer_id, layer):
+        layer.self_attn = layer.self_attn if hasattr(layer, 'self_attn') else layer.self_attention
+        super().make_layer(layer_id, layer)
+
 def check_extra_options(kv_pairs):
     if "use_8bits_moe" in kv_pairs:
         assert(kv_pairs["use_8bits_moe"] == "1" or kv_pairs["use_8bits_moe"] == "0"), "use_8bits_moe must be 0 or 1."
@@ -2635,6 +2873,23 @@ def parse_extra_options(kv_items):
     return kv_pairs
 
 
+def parse_hf_token(hf_token):
+    """
+    Returns the authentication token needed for Hugging Face.
+    Token is obtained either from the user or the environment.
+    """
+    if hf_token.lower() in {"false", "0"}:
+        # Default is `None` for disabling authentication
+        return None
+
+    if hf_token.lower() in {"true", "1"}:
+        # Return token in environment
+        return True
+
+    # Return user-provided token as string
+    return hf_token
+
+
 def create_model(model_name, input_path, output_dir, precision, execution_provider, cache_dir, **extra_options):
     # Create cache and output directories
     os.makedirs(output_dir, exist_ok=True)
@@ -2643,7 +2898,8 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
     # Load model config
     extra_kwargs = {} if os.path.isdir(input_path) else {"cache_dir": cache_dir}
     hf_name = input_path if os.path.isdir(input_path) else model_name
-    config = AutoConfig.from_pretrained(hf_name, use_auth_token=True, trust_remote_code=True, **extra_kwargs)
+    hf_token = parse_hf_token(extra_options.get("hf_token", "true"))
+    config = AutoConfig.from_pretrained(hf_name, token=hf_token, trust_remote_code=True, **extra_kwargs)
 
     # Set input/output precision of ONNX model
     io_dtype = TensorProto.FLOAT if precision in {"int8", "fp32"} or (precision == "int4" and execution_provider == "cpu") else TensorProto.FLOAT16
@@ -2680,6 +2936,12 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = Phi3VModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Qwen2ForCausalLM":
             onnx_model = QwenModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "NemotronForCausalLM":
+            onnx_model = NemotronModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "ChatGLMForConditionalGeneration" or config.architectures[0] == "ChatGLMModel":
+            # Quantized ChatGLM model has ChatGLMForConditionalGeneration as architecture whereas HF model as the latter
+            config.hidden_act = "swiglu"
+            onnx_model = ChatGLMModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         else:
             raise NotImplementedError(f"The {hf_name} model is not currently supported.")
 
@@ -2740,7 +3002,7 @@ def get_args():
         "-e",
         "--execution_provider",
         required=True,
-        choices=["cpu", "cuda", "dml", "web"],
+        choices=["cpu", "cuda", "rocm", "dml", "web"],
         help="Execution provider to target with precision of model (e.g. FP16 CUDA, INT4 CPU, INT4 WEB)",
     )
 
@@ -2782,6 +3044,9 @@ def get_args():
                     is the prerequisite for the CUDA graph to be used correctly. It is not guaranteed that cuda graph be enabled as it depends on the model
                     and the graph structure.
                 use_8bits_moe = 1 : Use 8-bit quantization for MoE layers. Default is using 4-bit quantization.
+                hf_token = false/token: Use this to disable authentication with Hugging Face or provide a custom authentication token that differs from the one stored in your environment. Default behavior is to use the authentication token stored by `huggingface-cli login`.
+                    If you have already authenticated via `huggingface-cli login`, you do not need to use this flag because Hugging Face has already stored your authentication token for you.
+                use_qdq = 1 : Use the QDQ decomposition for quantized MatMul instead of the MatMulNBits operator.
             """),
     )
 

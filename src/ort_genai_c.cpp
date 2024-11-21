@@ -8,6 +8,7 @@
 #include "ort_genai_c.h"
 #include "generators.h"
 #include "models/model.h"
+#include "runtime_settings.h"
 #include "search.h"
 
 namespace Generators {
@@ -134,13 +135,62 @@ OgaResult* OGA_API_CALL OgaLoadAudios(const OgaStringArray* audio_paths, OgaAudi
   OGA_CATCH
 }
 
-OgaResult* OGA_API_CALL OgaCreateModel(const char* config_path, OgaModel** out) {
+OgaResult* OGA_API_CALL OgaCreateRuntimeSettings(OgaRuntimeSettings** out) {
   OGA_TRY
-  auto model = Generators::CreateModel(Generators::GetOrtEnv(), config_path);
+  *out = reinterpret_cast<OgaRuntimeSettings*>(Generators::CreateRuntimeSettings().release());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaCreateModelWithRuntimeSettings(const char* config_path, const OgaRuntimeSettings* settings, OgaModel** out) {
+  OGA_TRY
+  auto model = Generators::CreateModel(Generators::GetOrtEnv(), config_path, reinterpret_cast<const Generators::RuntimeSettings*>(settings));
   model->external_owner_ = model;
   *out = reinterpret_cast<OgaModel*>(model.get());
   return nullptr;
   OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaCreateConfig(const char* config_path, OgaConfig** out) {
+  OGA_TRY
+  *out = reinterpret_cast<OgaConfig*>(std::make_unique<Generators::Config>(fs::path(config_path), std::string_view{}).release());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaConfigClearProviders(OgaConfig* config) {
+  OGA_TRY
+  Generators::ClearProviders(*reinterpret_cast<Generators::Config*>(config));
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaConfigAppendProvider(OgaConfig* config, const char* provider) {
+  OGA_TRY
+  Generators::SetProviderOption(*reinterpret_cast<Generators::Config*>(config), provider, {}, {});
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaConfigSetProviderOption(OgaConfig* config, const char* provider, const char* key, const char* value) {
+  OGA_TRY
+  Generators::SetProviderOption(*reinterpret_cast<Generators::Config*>(config), provider, key, value);
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaCreateModelFromConfig(const OgaConfig* config, OgaModel** out) {
+  OGA_TRY
+  auto config_copy = std::make_unique<Generators::Config>(*reinterpret_cast<const Generators::Config*>(config));
+  auto model = Generators::CreateModel(Generators::GetOrtEnv(), std::move(config_copy));
+  model->external_owner_ = model;
+  *out = reinterpret_cast<OgaModel*>(model.get());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaCreateModel(const char* config_path, OgaModel** out) {
+  return OgaCreateModelWithRuntimeSettings(config_path, nullptr, out);
 }
 
 OgaResult* OGA_API_CALL OgaCreateGeneratorParams(const OgaModel* model, OgaGeneratorParams** out) {
@@ -148,6 +198,14 @@ OgaResult* OGA_API_CALL OgaCreateGeneratorParams(const OgaModel* model, OgaGener
   auto params = std::make_shared<Generators::GeneratorParams>(*reinterpret_cast<const Generators::Model*>(model));
   params->external_owner_ = params;
   *out = reinterpret_cast<OgaGeneratorParams*>(params.get());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaRuntimeSettingsSetHandle(OgaRuntimeSettings* settings, const char* handle_name, void* handle) {
+  OGA_TRY
+  Generators::RuntimeSettings* settings_ = reinterpret_cast<Generators::RuntimeSettings*>(settings);
+  settings_->handles_[handle_name] = handle;
   return nullptr;
   OGA_CATCH
 }
@@ -251,6 +309,10 @@ bool OGA_API_CALL OgaGenerator_IsDone(const OgaGenerator* generator) {
   return reinterpret_cast<const Generators::Generator*>(generator)->IsDone();
 }
 
+bool OGA_API_CALL OgaGenerator_IsSessionTerminated(const OgaGenerator* generator) {
+  return reinterpret_cast<const Generators::Generator*>(generator)->IsSessionTerminated();
+}
+
 OgaResult* OGA_API_CALL OgaGenerator_ComputeLogits(OgaGenerator* generator) {
   OGA_TRY
   reinterpret_cast<Generators::Generator*>(generator)->ComputeLogits();
@@ -261,6 +323,13 @@ OgaResult* OGA_API_CALL OgaGenerator_ComputeLogits(OgaGenerator* generator) {
 OgaResult* OGA_API_CALL OgaGenerator_GenerateNextToken(OgaGenerator* generator) {
   OGA_TRY
   reinterpret_cast<Generators::Generator*>(generator)->GenerateNextToken();
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaGenerator_SetRuntimeOption(OgaGenerator* generator, const char* key, const char* value) {
+  OGA_TRY
+  reinterpret_cast<Generators::Generator*>(generator)->SetRuntimeOption(key, value);
   return nullptr;
   OGA_CATCH
 }
@@ -311,12 +380,12 @@ OgaResult* OGA_API_CALL OgaGenerator_GetOutput(const OgaGenerator* oga_generator
 
 size_t OGA_API_CALL OgaGenerator_GetSequenceCount(const OgaGenerator* oga_generator, size_t index) {
   auto& generator = *reinterpret_cast<const Generators::Generator*>(oga_generator);
-  return generator.GetSequence(static_cast<int>(index)).CpuSpan().size();
+  return generator.GetSequence(static_cast<int>(index)).size();
 }
 
 const int32_t* OGA_API_CALL OgaGenerator_GetSequenceData(const OgaGenerator* oga_generator, size_t index) {
   auto& generator = *reinterpret_cast<const Generators::Generator*>(oga_generator);
-  return generator.GetSequence(static_cast<int>(index)).CpuSpan().data();
+  return generator.GetSequence(static_cast<int>(index)).CopyDeviceToCpu().data();
 }
 
 OgaResult* OGA_API_CALL OgaCreateTokenizer(const OgaModel* model, OgaTokenizer** out) {
@@ -352,12 +421,7 @@ OgaResult* OGA_API_CALL OgaTokenizerDecode(const OgaTokenizer* p, const int32_t*
   auto string = tokenizer.Decode({tokens, token_count});
   auto length = string.length() + 1;
   auto cstr_buffer = std::make_unique<char[]>(length);
-#if _MSC_VER
-  strcpy_s(cstr_buffer.get(), length, string.c_str());
-#else
-  strncpy(cstr_buffer.get(), string.c_str(), length);
-  cstr_buffer[length] = 0;
-#endif
+  memcpy(cstr_buffer.get(), string.c_str(), length);
   *out_string = cstr_buffer.release();
   return nullptr;
   OGA_CATCH
@@ -370,12 +434,7 @@ OgaResult* OGA_API_CALL OgaProcessorDecode(const OgaMultiModalProcessor* p, cons
   auto string = processor.tokenizer_->Decode({tokens, token_count});
   auto length = string.length() + 1;
   auto cstr_buffer = std::make_unique<char[]>(length);
-#if _MSC_VER
-  strcpy_s(cstr_buffer.get(), length, string.c_str());
-#else
-  strncpy(cstr_buffer.get(), string.c_str(), length);
-  cstr_buffer[length] = 0;
-#endif
+  memcpy(cstr_buffer.get(), string.c_str(), length);
   *out_string = cstr_buffer.release();
   return nullptr;
   OGA_CATCH
@@ -580,6 +639,10 @@ void OGA_API_CALL OgaDestroySequences(OgaSequences* p) {
   delete reinterpret_cast<Generators::TokenSequences*>(p);
 }
 
+void OGA_API_CALL OgaDestroyConfig(OgaConfig* p) {
+  delete reinterpret_cast<Generators::Config*>(p);
+}
+
 void OGA_API_CALL OgaDestroyModel(OgaModel* p) {
   reinterpret_cast<Generators::Model*>(p)->external_owner_ = nullptr;
 }
@@ -623,4 +686,9 @@ void OGA_API_CALL OgaDestroyNamedTensors(OgaNamedTensors* p) {
 void OGA_API_CALL OgaDestroyAdapters(OgaAdapters* p) {
   reinterpret_cast<Generators::Adapters*>(p)->external_owner_ = nullptr;
 }
+
+void OGA_API_CALL OgaDestroyRuntimeSettings(OgaRuntimeSettings* p) {
+  delete reinterpret_cast<Generators::RuntimeSettings*>(p);
 }
+
+}  // extern "C"

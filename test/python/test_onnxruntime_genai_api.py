@@ -29,6 +29,15 @@ if og.is_dml_available():
 if og.is_rocm_available():
     devices.append("rocm")
 
+def test_config(test_data_path):
+    model_path = os.fspath(Path(test_data_path) / "hf-internal-testing" / "tiny-random-gpt2-fp32")
+    config = og.Config(model_path)
+    config.clear_providers()
+    config.append_provider("cuda")
+    config.clear_providers()
+    config.set_provider_option("cuda", "infinite_clock", "1")
+    config.set_provider_option("quantum", "break_universe", "true")
+    config.append_provider("slide rule")
 
 @pytest.mark.parametrize(
     "relative_model_path",
@@ -45,7 +54,8 @@ if og.is_rocm_available():
 def test_greedy_search(test_data_path, relative_model_path):
     model_path = os.fspath(Path(test_data_path) / relative_model_path)
 
-    model = og.Model(model_path)
+    config = og.Config(model_path) # Test using config vs path directly
+    model = og.Model(config)
 
     search_params = og.GeneratorParams(model)
     search_params.input_ids = np.array(
@@ -58,6 +68,12 @@ def test_greedy_search(test_data_path, relative_model_path):
     generator = og.Generator(model, search_params)
     while not generator.is_done():
         generator.compute_logits()
+
+        # Test getting/setting logits
+        logits = generator.get_logits()
+        generator.set_logits(logits)
+        generator.set_logits(logits) # twice just to be sure buffer is still valid
+
         generator.generate_next_token()
 
     expected_sequence = np.array(
@@ -432,6 +448,17 @@ def test_adapters(test_data_path, device, multiple_adapters, phi2_for):
         )
 
         model.graph.input.extend([adapter_a, adapter_b])
+
+        for adapter_name in ["adapter_a", "adapter_b"]:
+            adapter_weight = np.zeros([vocab_size], dtype=(np.float32 if device == "cpu" else np.float16))
+            adapter_weight_tensor = onnx.helper.make_tensor(
+                adapter_name,
+                onnx.TensorProto.FLOAT if device == "cpu" else onnx.TensorProto.FLOAT16,
+                [vocab_size],
+                adapter_weight.flatten()
+            )
+            model.graph.initializer.append(adapter_weight_tensor)
+
         add_node = onnx.helper.make_node(
             "Add", ["adapter_a", "adapter_b"], ["adapter_output"], name="adapter_add"
         )

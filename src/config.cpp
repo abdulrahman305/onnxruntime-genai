@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include "generators.h"
+#include "runtime_settings.h"
 #include "json.h"
 #include <fstream>
 #include <sstream>
@@ -33,8 +34,13 @@ struct ProviderOptionsObject_Element : JSON::Element {
   explicit ProviderOptionsObject_Element(std::vector<Config::ProviderOptions>& v) : v_{v} {}
 
   JSON::Element& OnObject(std::string_view name) override {
-    if (options_element_)
-      throw std::runtime_error("Each object in the provider_options array can only have one member (named value)");
+    for (auto& v : v_) {
+      if (v.name == name) {
+        options_element_ = std::make_unique<ProviderOptions_Element>(v);
+        return *options_element_;
+      }
+    }
+
     auto& options = v_.emplace_back();
     options.name = name;
     options_element_ = std::make_unique<ProviderOptions_Element>(options);
@@ -465,6 +471,38 @@ struct Embedding_Element : JSON::Element {
   EmbeddingOutputs_Element outputs_{v_.outputs};
 };
 
+struct PromptTemplates_Element : JSON::Element {
+  explicit PromptTemplates_Element(std::optional<Config::Model::PromptTemplates>& v) : v_{v} {}
+
+  void OnString(std::string_view name, std::string_view value) override {
+    // if one of templates is given in json, then any non-specified template will be default "{Content}"
+    if (name == "assistant") {
+      EnsureAvailable();
+      v_->assistant = value;
+    } else if (name == "prompt") {
+      EnsureAvailable();
+      v_->prompt = value;
+    } else if (name == "system") {
+      EnsureAvailable();
+      v_->system = value;
+    } else if (name == "user") {
+      EnsureAvailable();
+      v_->user = value;
+    } else {
+      throw JSON::unknown_value_error{};
+    }
+  }
+
+ private:
+  std::optional<Config::Model::PromptTemplates>& v_;
+
+  void EnsureAvailable() {
+    if (!v_.has_value()) {
+      v_.emplace();
+    }
+  }
+};
+
 struct Model_Element : JSON::Element {
   explicit Model_Element(Config::Model& v) : v_{v} {}
 
@@ -513,6 +551,9 @@ struct Model_Element : JSON::Element {
     if (name == "embedding") {
       return embedding_;
     }
+    if (name == "prompt_templates") {
+      return prompt_templates_;
+    }
     throw JSON::unknown_value_error{};
   }
 
@@ -523,6 +564,7 @@ struct Model_Element : JSON::Element {
   Eos_Array_Element eos_token_ids_{v_};
   Vision_Element vision_{v_.vision};
   Embedding_Element embedding_{v_.embedding};
+  PromptTemplates_Element prompt_templates_{v_.prompt_templates};
 };
 
 struct Search_Element : JSON::Element {
@@ -586,6 +628,21 @@ void SetSearchBool(Config::Search& search, std::string_view name, bool value) {
   Search_Element(search).OnBool(name, value);
 }
 
+void ClearProviders(Config& config) {
+  config.model.decoder.session_options.provider_options.clear();
+}
+
+void SetProviderOption(Config& config, std::string_view provider_name, std::string_view option_name, std::string_view option_value) {
+  std::ostringstream json;
+  json << R"({")" << provider_name << R"(":{)";
+  if (!option_name.empty()) {
+    json << R"(")" << option_name << R"(":")" << option_value << R"(")";
+  }
+  json << R"(}})";
+  ProviderOptionsArray_Element element{config.model.decoder.session_options.provider_options};
+  JSON::Parse(element, json.str());
+}
+
 bool IsCudaGraphEnabled(Config::SessionOptions& session_options) {
   for (const auto& provider_options : session_options.provider_options) {
     if (provider_options.name == "cuda") {
@@ -635,7 +692,7 @@ struct RootObject_Element : JSON::Element {
   JSON::Element& t_;
 };
 
-void ParseConfig(const fs::path& filename, Config& config) {
+void ParseConfig(const fs::path& filename, std::string_view json_overlay, Config& config) {
   std::ifstream file = filename.open(std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
     throw std::runtime_error("Error opening " + filename.string());
@@ -657,10 +714,20 @@ void ParseConfig(const fs::path& filename, Config& config) {
     oss << "Error encountered while parsing '" << filename.string() << "' " << message.what();
     throw std::runtime_error(oss.str());
   }
+
+  if (!json_overlay.empty()) {
+    try {
+      JSON::Parse(root_object, json_overlay);
+    } catch (const std::exception& message) {
+      std::ostringstream oss;
+      oss << "Error encountered while parsing config overlay: " << message.what();
+      throw std::runtime_error(oss.str());
+    }
+  }
 }
 
-Config::Config(const fs::path& path) : config_path{path} {
-  ParseConfig(path / "genai_config.json", *this);
+Config::Config(const fs::path& path, std::string_view json_overlay) : config_path{path} {
+  ParseConfig(path / "genai_config.json", json_overlay, *this);
 
   if (model.context_length == 0)
     throw std::runtime_error("model context_length is 0 or was not set. It must be greater than 0");

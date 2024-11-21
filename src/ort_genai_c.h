@@ -50,6 +50,8 @@ typedef enum OgaElementType {
 typedef struct OgaResult OgaResult;
 typedef struct OgaGeneratorParams OgaGeneratorParams;
 typedef struct OgaGenerator OgaGenerator;
+typedef struct OgaRuntimeSettings OgaRuntimeSettings;
+typedef struct OgaConfig OgaConfig;
 typedef struct OgaModel OgaModel;
 // OgaSequences is an array of token arrays where the number of token arrays can be obtained using
 // OgaSequencesCount and the number of tokens in each token array can be obtained using OgaSequencesGetSequenceCount.
@@ -150,13 +152,91 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaLoadAudios(const OgaStringArray* audio_pat
 OGA_EXPORT void OGA_API_CALL OgaDestroyAudios(OgaAudios* audios);
 
 /*
- * \brief Creates a model from the given configuration directory and device type.
+ * \brief Creates a runtime settings instance to be used to create a model.
+ * \param[out] out The created runtime settings.
+ * \return OgaResult containing the error message if the creation of the runtime settings failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateRuntimeSettings(OgaRuntimeSettings** out);
+/*
+ * \brief Destroys the given runtime settings.
+ * \param[in] settings The runtime settings to be destroyed.
+ */
+OGA_EXPORT void OGA_API_CALL OgaDestroyRuntimeSettings(OgaRuntimeSettings* settings);
+
+/*
+ * \brief Sets a specific runtime handle for the runtime settings.
+ * \param[in] settings The runtime settings to set the device type.
+ * \param[in] handle_name The name of the handle to set for the runtime settings.
+ * \param[in] handle The value of handle to set for the runtime settings.
+ * \return OgaResult containing the error message if the setting of the device type failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaRuntimeSettingsSetHandle(OgaRuntimeSettings* settings, const char* handle_name, void* handle);
+
+/*
+ * \brief Creates an OgaConfig from the given configuration directory.
+ * \param[in] config_path The path to the configuration directory. The path is expected to be encoded in UTF-8.
+ * \param[out] out The created config.
+ * \return OgaResult containing the error message if the creation of the config failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateConfig(const char* config_path, OgaConfig** out);
+
+/*
+ * \brief Clear the list of providers in the given config
+ * \param[in] config The config to clear the providers from.
+ * \return OgaResult containing the error message if the clearing of the providers failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaConfigClearProviders(OgaConfig* config);
+
+/*
+ * \brief Add the provider at the end of the list of providers in the given config if it doesn't already exist
+ * if it already exists, does nothing.
+ * \param[in] config The config to set the provider on.
+ * \param[in] provider The provider to set on the config.
+ * \return OgaResult containing the error message if the setting of the provider failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaConfigAppendProvider(OgaConfig* config, const char* provider);
+
+/*
+ * \brief Set a provider option
+ * \param[in] config The config to set the provider option on.
+ * \param[in] provider The provider to set the option on.
+ * \param[in] key The key of the option to set.
+ * \param[in] value The value of the option to set.
+ * \return OgaResult containing the error message if the setting of the provider option failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaConfigSetProviderOption(OgaConfig* config, const char* provider, const char* key, const char* value);
+
+/*
+ * \brief Creates a model from the given configuration directory.
  * \param[in] config_path The path to the model configuration directory. The path is expected to be encoded in UTF-8.
- * \param[in] device_type The device type to use for the model.
  * \param[out] out The created model.
  * \return OgaResult containing the error message if the model creation failed.
  */
 OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateModel(const char* config_path, OgaModel** out);
+
+/*
+ * \brief Creates a model from the given configuration.
+ * \param[in] config The configuration to use for the model.
+ * \param[out] out The created model.
+ * \return OgaResult containing the error message if the model creation failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateModelFromConfig(const OgaConfig* config, OgaModel** out);
+
+/*
+ * \brief Creates a model from the given configuration directory, runtime settings and device type.
+ * \param[in] config_path The path to the model configuration directory. The path is expected to be encoded in UTF-8.
+ * \param[in] settings The runtime settings to use for the model.
+ * \param[in] device_type The device type to use for the model.
+ * \param[out] out The created model.
+ * \return OgaResult containing the error message if the model creation failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateModelWithRuntimeSettings(const char* config_path, const OgaRuntimeSettings* settings, OgaModel** out);
+
+/*
+ * \brief Destroys the given config
+ * \param[in] config The config to be destroyed.
+ */
+OGA_EXPORT void OGA_API_CALL OgaDestroyConfig(OgaConfig* config);
 
 /*
  * \brief Destroys the given model.
@@ -246,6 +326,7 @@ OGA_EXPORT void OGA_API_CALL OgaDestroyGenerator(OgaGenerator* generator);
  * \return True if the generator has finished generating all the sequences, false otherwise.
  */
 OGA_EXPORT bool OGA_API_CALL OgaGenerator_IsDone(const OgaGenerator* generator);
+OGA_EXPORT bool OGA_API_CALL OgaGenerator_IsSessionTerminated(const OgaGenerator* generator);
 
 /*
  * \brief Computes the logits from the model based on the input ids and the past state. The computed logits are stored in the generator.
@@ -254,6 +335,8 @@ OGA_EXPORT bool OGA_API_CALL OgaGenerator_IsDone(const OgaGenerator* generator);
  */
 OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_ComputeLogits(OgaGenerator* generator);
 OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GenerateNextToken(OgaGenerator* generator);
+
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_SetRuntimeOption(OgaGenerator* generator, const char* key, const char* value);
 
 /*
  * \brief Returns a copy of the model output identified by the given name as an OgaTensor on CPU. The buffer is owned by returned OgaTensor

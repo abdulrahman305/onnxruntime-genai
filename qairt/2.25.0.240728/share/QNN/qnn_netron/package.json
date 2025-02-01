@@ -20,7 +20,7 @@
         "python-shell": "file:./deps/python-shell"
     },
     "devDependencies": {
-        "electron": "22.3.25",
+        "electron": "32.3.0",
         "electron-builder": "22.10.5",
         "eslint": "7.26.0",
         "xmldom": "0.6.0"

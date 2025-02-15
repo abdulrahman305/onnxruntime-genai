@@ -77,7 +77,7 @@ def _parse_args():
     parser.add_argument("--build", action="store_true", help="Build.")
     parser.add_argument("--test", action="store_true", help="Run tests.")
     parser.add_argument(
-        "--clean", action="store_true", help="Run 'cmake --build --target clean' for the selected config/s."
+        "--clean", action="store_true", help="Run 'cmake --build --target clean' for the selected config."
     )
 
     parser.add_argument("--skip_tests", action="store_true", help="Skip all tests. Overrides --test.")
@@ -125,8 +125,6 @@ def _parse_args():
     )
 
     parser.add_argument("--use_rocm", action="store_true", help="Whether to use ROCm. Default is to not use rocm.")
-
-    parser.add_argument("--use_webgpu", action="store_true", help="Whether to use WebGpu. Default is to not use WebGpu.")
 
     parser.add_argument("--use_dml", action="store_true", help="Whether to use DML. Default is to not use DML.")
 
@@ -322,7 +320,7 @@ def _validate_cmake_args(args: argparse.Namespace):
 
 def _validate_args(args: argparse.Namespace):
     # default to all 3 stages
-    if not args.update and not args.build and not args.test:
+    if not any((args.update, args.clean, args.build, args.test)):
         args.update = True
         args.build = True
         args.test = True
@@ -453,7 +451,7 @@ def update(args: argparse.Namespace, env: dict[str, str]):
 
             is_x64_host = platform.machine() == "AMD64"
             if is_x64_host:
-                toolset_options += ["host=x64"]
+                pass
 
             if args.use_cuda:
                 toolset_options += ["cuda=" + str(args.cuda_home)]
@@ -473,7 +471,6 @@ def update(args: argparse.Namespace, env: dict[str, str]):
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         f"-DUSE_CUDA={'ON' if args.use_cuda else 'OFF'}",
         f"-DUSE_ROCM={'ON' if args.use_rocm else 'OFF'}",
-        f"-DUSE_WEBGPU={'ON' if args.use_webgpu else 'OFF'}",
         f"-DUSE_DML={'ON' if args.use_dml else 'OFF'}",
         f"-DENABLE_JAVA={'ON' if args.build_java else 'OFF'}",
         f"-DBUILD_WHEEL={build_wheel}",
@@ -500,12 +497,17 @@ def update(args: argparse.Namespace, env: dict[str, str]):
     if args.ios or args.macos:
         platform_name = "macabi" if args.macos == "Catalyst" else args.apple_sysroot
         command += [
-            "-DENABLE_PYTHON=OFF",
-            "-DENABLE_TESTS=OFF",
-            "-DENABLE_MODEL_BENCHMARK=OFF",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=" + args.apple_deploy_target,
             f"-DBUILD_APPLE_FRAMEWORK={'ON' if args.build_apple_framework else 'OFF'}",
             "-DPLATFORM_NAME=" + platform_name,
         ]
+
+        if args.ios or args.macos == "Catalyst" or args.build_apple_framework:
+            command += [
+                "-DENABLE_PYTHON=OFF",
+                "-DENABLE_TESTS=OFF",
+                "-DENABLE_MODEL_BENCHMARK=OFF",
+            ]
 
     if args.macos:
         command += [
@@ -624,6 +626,10 @@ def test(args: argparse.Namespace, env: dict[str, str]):
         csharp_test_command += _get_csharp_properties(args, ort_lib_dir=lib_dir)
         util.run(csharp_test_command, env=env, cwd=str(REPO_ROOT / "test" / "csharp"))
 
+    if args.build_java:
+        ctest_cmd = [str(args.ctest_path), "--build-config", args.config, "--verbose", "--timeout", "10800"]
+        util.run(ctest_cmd, cwd=str(args.build_dir / "src" / "java"))
+
     if args.android:
         _run_android_tests(args)
 
@@ -633,12 +639,12 @@ def clean(args: argparse.Namespace, env: dict[str, str]):
     Clean the build output.
     """
     log.info("Cleaning targets")
-    cmd_args = [str(args.cmake), "--build", str(args.build_dir), "--config", args.config, "--target", "clean"]
+    cmd_args = [str(args.cmake_path), "--build", str(args.build_dir), "--config", args.config, "--target", "clean"]
     util.run(cmd_args, env=env)
 
 
 if __name__ == "__main__":
-    if not (util.is_windows() or util.is_linux() or util.is_mac()):
+    if not (util.is_windows() or util.is_linux() or util.is_mac() or util.is_aix()):
         raise OSError(f"Unsupported platform {sys.platform}.")
 
     arguments = _parse_args()
@@ -648,6 +654,9 @@ if __name__ == "__main__":
 
     if arguments.update:
         update(arguments, environment)
+
+    if arguments.clean:
+        clean(arguments, environment)
 
     if arguments.build:
         build(arguments, environment)

@@ -10,6 +10,7 @@
 #include "models/model.h"
 #include "runtime_settings.h"
 #include "search.h"
+#include "smartptrs.h"
 
 namespace Generators {
 
@@ -232,36 +233,6 @@ OgaResult* OGA_API_CALL OgaGeneratorParamsTryGraphCaptureWithMaxBatchSize(OgaGen
   OGA_CATCH
 }
 
-OgaResult* OGA_API_CALL OgaGeneratorParamsSetInputIDs(OgaGeneratorParams* oga_params, const int32_t* input_ids, size_t input_ids_count, size_t sequence_length, size_t batch_size) {
-  OGA_TRY
-  auto& params = *reinterpret_cast<Generators::GeneratorParams*>(oga_params);
-  params.input_ids = std::span<const int32_t>(input_ids, input_ids_count);
-  params.sequence_length = static_cast<int>(sequence_length);
-  params.batch_size = static_cast<int>(batch_size);
-  if (params.sequence_length * params.batch_size != input_ids_count)
-    throw std::runtime_error("sequence length * batch size is not equal to input_ids_count");
-  return nullptr;
-  OGA_CATCH
-}
-
-OgaResult* OGA_API_CALL OgaGeneratorParamsSetInputSequences(OgaGeneratorParams* oga_params, const OgaSequences* p_sequences) {
-  OGA_TRY
-  auto& params = *reinterpret_cast<Generators::GeneratorParams*>(oga_params);
-  auto& sequences = *reinterpret_cast<const Generators::TokenSequences*>(p_sequences);
-
-  std::vector<std::span<const int32_t>> span_sequences;
-  for (size_t i = 0; i < sequences.size(); i++) {
-    span_sequences.emplace_back(sequences[i]);
-  }
-
-  params.input_ids_owner = Generators::PadInputs(span_sequences, params.config.model.pad_token_id);
-  params.batch_size = static_cast<int>(sequences.size());
-  params.sequence_length = static_cast<int>(params.input_ids_owner.size() / params.batch_size);
-  params.input_ids = params.input_ids_owner;
-  return nullptr;
-  OGA_CATCH
-}
-
 OgaResult* OGA_API_CALL OgaGeneratorParamsSetInputs(OgaGeneratorParams* oga_params, const OgaNamedTensors* p_named_tensors) {
   OGA_TRY
   auto& params = *reinterpret_cast<Generators::GeneratorParams*>(oga_params);
@@ -290,14 +261,6 @@ OgaResult* OGA_API_CALL OgaGeneratorParamsSetWhisperInputFeatures(OgaGeneratorPa
   OGA_CATCH
 }
 
-OgaResult* OGA_API_CALL OgaGenerate(const OgaModel* model, const OgaGeneratorParams* generator_params, OgaSequences** out) {
-  OGA_TRY
-  auto result = Generators::Generate(*reinterpret_cast<const Generators::Model*>(model), *reinterpret_cast<const Generators::GeneratorParams*>(generator_params));
-  *out = reinterpret_cast<OgaSequences*>(std::make_unique<Generators::TokenSequences>(std::move(result)).release());
-  return nullptr;
-  OGA_CATCH
-}
-
 OgaResult* OgaCreateGenerator(const OgaModel* model, const OgaGeneratorParams* generator_params, OgaGenerator** out) {
   OGA_TRY
   *out = reinterpret_cast<OgaGenerator*>(CreateGenerator(*reinterpret_cast<const Generators::Model*>(model), *reinterpret_cast<const Generators::GeneratorParams*>(generator_params)).release());
@@ -313,9 +276,31 @@ bool OGA_API_CALL OgaGenerator_IsSessionTerminated(const OgaGenerator* generator
   return reinterpret_cast<const Generators::Generator*>(generator)->IsSessionTerminated();
 }
 
-OgaResult* OGA_API_CALL OgaGenerator_ComputeLogits(OgaGenerator* generator) {
+OgaResult* OGA_API_CALL OgaGenerator_AppendTokenSequences(OgaGenerator* oga_generator, const OgaSequences* p_sequences) {
   OGA_TRY
-  reinterpret_cast<Generators::Generator*>(generator)->ComputeLogits();
+  auto& generator = *reinterpret_cast<Generators::Generator*>(oga_generator);
+  auto& sequences = *reinterpret_cast<const Generators::TokenSequences*>(p_sequences);
+
+  if (sequences.empty()) {
+    throw std::runtime_error("input sequences are empty");
+  } else if (sequences.size() != generator.state_->params_->search.batch_size) {
+    throw std::runtime_error("input sequences count does not match batch size");
+  }
+  std::vector<std::span<const int32_t>> span_sequences;
+  for (size_t i = 0; i < sequences.size(); i++) {
+    span_sequences.emplace_back(sequences[i]);
+  }
+
+  auto input_ids = Generators::PadInputs(span_sequences, generator.model_->config_->model.pad_token_id);
+  generator.AppendTokens(input_ids);
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaGenerator_AppendTokens(OgaGenerator* oga_generator, const int32_t* input_ids, size_t input_ids_count) {
+  OGA_TRY
+  auto& generator = *reinterpret_cast<Generators::Generator*>(oga_generator);
+  generator.AppendTokens(Generators::cpu_span<const int32_t>(input_ids, input_ids_count));
   return nullptr;
   OGA_CATCH
 }
@@ -323,6 +308,13 @@ OgaResult* OGA_API_CALL OgaGenerator_ComputeLogits(OgaGenerator* generator) {
 OgaResult* OGA_API_CALL OgaGenerator_GenerateNextToken(OgaGenerator* generator) {
   OGA_TRY
   reinterpret_cast<Generators::Generator*>(generator)->GenerateNextToken();
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaGenerator_RewindTo(OgaGenerator* generator, size_t new_length) {
+  OGA_TRY
+  reinterpret_cast<Generators::Generator*>(generator)->RewindToLength(new_length);
   return nullptr;
   OGA_CATCH
 }
@@ -339,41 +331,56 @@ OgaResult* OGA_API_CALL OgaGenerator_GetOutput(const OgaGenerator* oga_generator
   auto& generator = *reinterpret_cast<const Generators::Generator*>(oga_generator);
   auto* ortvalue_output = generator.state_->GetOutput(name);
   auto type_info = ortvalue_output->GetTensorTypeAndShapeInfo();
-  std::unique_ptr<OrtValue> ortvalue_clone = OrtValue::CreateTensor(generator.model_->allocator_cpu_,
-                                                                    type_info->GetShape(),
-                                                                    type_info->GetElementType());
+  auto ortvalue_clone = OrtValue::CreateTensor(generator.model_->allocator_cpu_, type_info->GetShape(), type_info->GetElementType());
+
   // Copy data to ortvalue_clone
-  auto element_size = Generators::SizeOf(type_info->GetElementType());
-  auto data_size = type_info->GetElementCount() * element_size;
-  if (ortvalue_output->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU && generator.model_->device_type_ == Generators::DeviceType::CUDA) {
-#if USE_CUDA
-    cudaMemcpy(ortvalue_clone->GetTensorMutableRawData(), ortvalue_output->GetTensorMutableRawData(), data_size, cudaMemcpyDeviceToHost);
-#endif
-  } else if (ortvalue_output->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU && generator.model_->device_type_ == Generators::DeviceType::DML) {
-#if USE_DML
-    ComPtr<ID3D12Resource> gpu_resource;
-    Ort::ThrowOnError(generator.model_->GetOrtDmlApi()->GetD3D12ResourceFromAllocation(
-        generator.model_->allocator_device_,
-        ortvalue_output->GetTensorMutableRawData(),
-        &gpu_resource));
-    auto cpu_tensor = ortvalue_clone->GetTensorMutableRawData();
-    generator.model_->GetDmlReadbackHeap()->ReadbackFromGpu(
-        std::span(reinterpret_cast<uint8_t*>(cpu_tensor), data_size),
-        gpu_resource.Get(),
-        0,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-#endif
-  } else if (ortvalue_output->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_CPU) {
-    std::copy(static_cast<uint8_t*>(ortvalue_output->GetTensorMutableRawData()),
-              static_cast<uint8_t*>(ortvalue_output->GetTensorMutableRawData()) + data_size,
-              static_cast<uint8_t*>(ortvalue_clone->GetTensorMutableRawData()));
-  } else {
-    throw std::runtime_error("Unsupported Device type: " + std::to_string(ortvalue_output->GetTensorMemoryInfo().GetDeviceType()));
-  }
+  bool is_cpu = ortvalue_output->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_CPU;
+  auto output_span = Generators::ByteWrapTensor(is_cpu ? *Generators::GetDeviceInterface(Generators::DeviceType::CPU) : *generator.model_->p_device_, *ortvalue_output);
+  auto copy_span = Generators::ByteWrapTensor(*Generators::GetDeviceInterface(Generators::DeviceType::CPU), *ortvalue_clone);
+  copy_span.CopyFrom(output_span);
 
   auto tensor = std::make_shared<Generators::Tensor>(std::move(ortvalue_clone));
   tensor->external_owner_ = tensor;
   *out = reinterpret_cast<OgaTensor*>(tensor.get());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaGenerator_GetLogits(OgaGenerator* oga_generator, OgaTensor** out) {
+  OGA_TRY
+  auto generator = reinterpret_cast<Generators::Generator*>(oga_generator);
+  auto logits_span = generator->GetLogits();
+  const std::array<int64_t, 3> shape{generator->state_->params_->search.batch_size, 1, generator->model_->config_->model.vocab_size};
+  std::span<const float> cpu_logits_span = logits_span.CopyDeviceToCpu();
+
+  // Copy logits to cpu tensor
+  std::unique_ptr<OrtValue> ortvalue_clone = OrtValue::CreateTensor<float>(generator->model_->allocator_cpu_, shape);
+  auto clone_span = std::span<float>(ortvalue_clone->GetTensorMutableData<float>(), cpu_logits_span.size());
+  Generators::copy(cpu_logits_span, clone_span);
+  auto tensor = std::make_shared<Generators::Tensor>(std::move(ortvalue_clone));
+  tensor->external_owner_ = tensor;
+  *out = reinterpret_cast<OgaTensor*>(tensor.get());
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OGA_API_CALL OgaGenerator_SetLogits(OgaGenerator* oga_generator, OgaTensor* tensor) {
+  OGA_TRY
+  auto generator = reinterpret_cast<Generators::Generator*>(oga_generator);
+  if (!generator->computed_logits_) {
+    throw std::runtime_error("logits are not computed yet. Please call GenerateNextToken or AppendTokens before calling SetLogits.");
+  }
+  auto logits_tensor = reinterpret_cast<Generators::Tensor*>(tensor);
+  size_t element_count = logits_tensor->ort_tensor_->GetTensorTypeAndShapeInfo()->GetElementCount();
+  auto new_logits_span = std::span<const float>(logits_tensor->ort_tensor_->GetTensorData<float>(), element_count);
+  auto logits = generator->search_->GetLogits();
+  if (new_logits_span.size() != logits.size()) {
+    throw std::runtime_error("Generator::SetLogits passed an array of size " +
+                             std::to_string(new_logits_span.size()) + " but should be size " + std::to_string(logits.size()));
+  }
+  Generators::copy(new_logits_span, logits.CpuSpan());
+  logits.CopyCpuToDevice();
+  generator->computed_logits_ = true;
   return nullptr;
   OGA_CATCH
 }

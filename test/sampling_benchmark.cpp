@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include <gtest/gtest.h>
-#include <generators.h>
-#include <search.h>
-#include <models/model.h>
+#include <chrono>
 #include <iostream>
 #include <random>
-#include <chrono>
+
+#include <gtest/gtest.h>
+
+#include "generators.h"
+#include "models/model.h"
+#include "search.h"
 
 // Our working directory is generators/build so one up puts us in the root directory:
 #ifndef MODEL_PATH
@@ -30,11 +32,8 @@ struct SamplingBenchmark {
 
     auto params = Generators::CreateGeneratorParams(config);
     params->search.max_length = 10;
-    params->batch_size = batch_size_;
-    params->sequence_length = 1;
-    params->input_ids = input_ids;
+    params->search.batch_size = batch_size_;
     params->p_device = Generators::GetDeviceInterface(device_type_);
-    params->device_type = device_type_;
 
     std::random_device rd;
     std::mt19937 engine(rd());

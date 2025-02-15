@@ -10,9 +10,7 @@
 #include "../search.h"
 #include "../models/model.h"
 #include "../logging.h"
-#if USE_CUDA
-#include "../cuda/cuda_common.h"
-#endif
+#include "../smartptrs.h"
 
 using namespace pybind11::literals;
 
@@ -35,7 +33,7 @@ struct npy_format_descriptor<Ort::Float16_t> {
 }  // namespace pybind11
 
 template <typename T>
-std::span<T> ToSpan(pybind11::array_t<T> v) {
+Generators::cpu_span<T> ToSpan(pybind11::array_t<T> v) {
   if constexpr (std::is_const_v<T>)
     return {v.data(), static_cast<size_t>(v.size())};
   else
@@ -129,8 +127,16 @@ std::unique_ptr<OrtValue> ToOrtValue(pybind11::array& v) {
   for (pybind11::ssize_t i = 0; i < v.ndim(); i++)
     shape[i] = v.shape()[i];
 
-  auto p_memory_info = OrtMemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
-  return OrtValue::CreateTensor(*p_memory_info, v.mutable_data(), v.nbytes(), shape, type);
+  // Check if v is contiguous
+  if ((v.flags() & (pybind11::array::c_style | pybind11::array::f_style)) == 0)
+    throw std::runtime_error("Array must be contiguous. Please use NumPy's 'ascontiguousarray' method on the value.");
+
+  // Copy data into ort_value
+  auto ort_value = OrtValue::CreateTensor(Ort::Allocator::GetWithDefaultOptions(), shape, type);
+  auto ort_data = ort_value->GetTensorMutableData<uint8_t>();
+  auto python_data = reinterpret_cast<const uint8_t*>(v.data());
+  std::copy(python_data, python_data + v.nbytes(), ort_data);
+  return ort_value;
 }
 
 pybind11::array ToNumpy(OrtValue* v, const Generators::Model& model) {
@@ -141,50 +147,21 @@ pybind11::array ToNumpy(OrtValue* v, const Generators::Model& model) {
   auto shape = type_info->GetShape();
   auto type = type_info->GetElementType();
   auto element_size = Generators::SizeOf(type);
-  auto data = v->GetTensorMutableRawData();
-
-  std::unique_ptr<uint8_t[]> cpu_copy;
-
-#if USE_DML
-  // TODO: DML version of this
-  if (v->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU && model.device_type_ == Generators::DeviceType::DML) {
-    auto data_size = type_info->GetElementCount() * element_size;
-    cpu_copy = std::make_unique<uint8_t[]>(data_size);
-
-    ComPtr<ID3D12Resource> gpu_resource;
-    Ort::ThrowOnError(model.GetOrtDmlApi()->GetD3D12ResourceFromAllocation(
-        model.allocator_device_,
-        data,
-        &gpu_resource));
-
-    model.GetDmlReadbackHeap()->ReadbackFromGpu(
-        std::span(reinterpret_cast<uint8_t*>(cpu_copy.get()), data_size),
-        gpu_resource.Get(),
-        0,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    data = cpu_copy.get();
-  }
-#endif
-#if USE_CUDA
-  if (v->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_GPU && model.device_type_ == Generators::DeviceType::CUDA) {
-    auto data_size = type_info->GetElementCount() * element_size;
-    cpu_copy = std::make_unique<uint8_t[]>(data_size);
-    Generators::CudaCheck() == cudaMemcpy(cpu_copy.get(), data, data_size, cudaMemcpyDeviceToHost);
-    data = cpu_copy.get();
-  }
-#endif
 
   std::vector<int64_t> strides(shape.size());
   {
-    auto size = Generators::SizeOf(type);
+    auto size = element_size;
     for (size_t i = strides.size(); i-- > 0;) {
       strides[i] = size;
       size *= shape[i];
     }
   }
 
+  bool is_cpu = v->GetTensorMemoryInfo().GetDeviceType() == OrtMemoryInfoDeviceType_CPU;
+  auto device_span = Generators::ByteWrapTensor(is_cpu ? *Generators::GetDeviceInterface(Generators::DeviceType::CPU) : *model.p_device_, *v);
+
   pybind11::buffer_info bufinfo{
-      data,                                          // Pointer to memory buffer
+      device_span.CopyDeviceToCpu().data(),          // Pointer to memory buffer
       static_cast<pybind11::ssize_t>(element_size),  // Size of underlying scalar type
       ToFormatDescriptor(type),                      // Python struct-style format descriptor
       static_cast<pybind11::ssize_t>(shape.size()),  // Number of dimensions
@@ -213,6 +190,13 @@ struct PyDeviceMemorySpan {
   pybind11::array_t<T> py_cpu_array_;
 };
 
+struct PyNamedTensors {
+  PyNamedTensors(std::unique_ptr<NamedTensors> named_tensors) : named_tensors_{std::move(named_tensors)} {
+  }
+
+  std::unique_ptr<NamedTensors> named_tensors_;
+};
+
 struct PyGeneratorParams {
   PyGeneratorParams(const Model& model) : params_{std::make_shared<GeneratorParams>(model)} {
   }
@@ -221,23 +205,7 @@ struct PyGeneratorParams {
 
   std::shared_ptr<GeneratorParams> params_;
 
-  // Turn the python py_input_ids_ into the low level parameters
   void Prepare() {
-    // TODO: This will switch to using the variant vs being ifs
-    if (py_input_ids_.size() != 0) {
-      if (py_input_ids_.ndim() == 1) {  // Just a 1D array
-        params_->batch_size = 1;
-        params_->sequence_length = static_cast<int>(py_input_ids_.shape(0));
-      } else {
-        if (py_input_ids_.ndim() != 2)
-          throw std::runtime_error("Input IDs can only be 1 or 2 dimensional");
-
-        params_->batch_size = static_cast<int>(py_input_ids_.shape(0));
-        params_->sequence_length = static_cast<int>(py_input_ids_.shape(1));
-      }
-      params_->input_ids = ToSpan(py_input_ids_);
-    }
-
     if (py_whisper_input_features_.size() != 0) {
       GeneratorParams::Whisper& whisper = params_->inputs.emplace<GeneratorParams::Whisper>();
       whisper.input_features = std::make_shared<Tensor>(ToOrtValue(py_whisper_input_features_));
@@ -250,6 +218,11 @@ struct PyGeneratorParams {
   void SetModelInput(const std::string& name, pybind11::array& value) {
     params_->extra_inputs.push_back({name, std::make_shared<Tensor>(ToOrtValue(value))});
     refs_.emplace_back(value);
+  }
+
+  void SetInputs(std::shared_ptr<PyNamedTensors> named_tensors) {
+    params_->SetInputs(*named_tensors->named_tensors_);
+    named_tensors_ = named_tensors;
   }
 
   void SetSearchOptions(const pybind11::kwargs& dict) {
@@ -279,24 +252,16 @@ struct PyGeneratorParams {
     params_->TryGraphCapture(max_batch_size.cast<int>());
   }
 
-  pybind11::array_t<int32_t> py_input_ids_;
   pybind11::array py_whisper_input_features_;
   pybind11::array py_alignment_heads_;
 
-  std::vector<pybind11::object> refs_;  // References to data we want to ensure doesn't get garbage collected
-};
-
-struct PyNamedTensors {
-  PyNamedTensors(std::unique_ptr<NamedTensors> named_tensors) : named_tensors_{std::move(named_tensors)} {
-  }
-
-  std::unique_ptr<NamedTensors> named_tensors_;
+  std::vector<pybind11::object> refs_;             // References to data we want to ensure doesn't get garbage collected
+  std::shared_ptr<PyNamedTensors> named_tensors_;  // Ensure the model inputs don't get garbage collected
 };
 
 struct PyGenerator {
   PyGenerator(Model& model, PyGeneratorParams& params) {
-    params.Prepare();
-    generator_ = CreateGenerator(model, params);
+    generator_ = CreateGenerator(model, *params.params_);
   }
 
   pybind11::array_t<int32_t> GetNextTokens() {
@@ -309,16 +274,16 @@ struct PyGenerator {
     return py_sequence_.GetNumpy();
   }
 
-  void ComputeLogits() {
-    generator_->ComputeLogits();
-  }
-
   pybind11::array GetOutput(const std::string& name) {
     return ToNumpy(generator_->state_->GetOutput(name.c_str()), *(generator_->model_));
   }
 
+  void AppendTokens(pybind11::array_t<int32_t> tokens) {
+    generator_->AppendTokens(ToSpan(tokens));
+  }
+
   pybind11::array_t<float> GetLogits() {
-    py_logits_ = generator_->search_->GetLogits();
+    py_logits_ = generator_->GetLogits();
     return py_logits_.GetNumpy();
   }
 
@@ -329,10 +294,15 @@ struct PyGenerator {
 
     copy(std::span<const float>{ToSpan(new_logits)}, logits.CpuSpan());
     logits.CopyCpuToDevice();
+    generator_->computed_logits_ = true;
   }
 
   void GenerateNextToken() {
     generator_->GenerateNextToken();
+  }
+
+  void RewindToLength(size_t new_length) {
+    generator_->RewindToLength(new_length);
   }
 
   bool IsDone() const {
@@ -395,15 +365,14 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
       .def_property_readonly("pad_token_id", [](const PyGeneratorParams& v) { return v.params_->config.model.pad_token_id; })
       .def_property_readonly("eos_token_id", [](const PyGeneratorParams& v) { return v.params_->config.model.eos_token_id; })
       .def_property_readonly("vocab_size", [](const PyGeneratorParams& v) { return v.params_->config.model.vocab_size; })
-      .def_readwrite("input_ids", &PyGeneratorParams::py_input_ids_)
       // TODO(baijumeswani): Rename/redesign the whisper_input_features to be more generic
       .def_readwrite("whisper_input_features", &PyGeneratorParams::py_whisper_input_features_)
       .def_readwrite("alignment_heads", &PyGeneratorParams::py_alignment_heads_)
-      .def("set_inputs", [](PyGeneratorParams& generator_params, PyNamedTensors* named_tensors) {
+      .def("set_inputs", [](PyGeneratorParams& generator_params, std::shared_ptr<PyNamedTensors> named_tensors) {
         if (!named_tensors || !named_tensors->named_tensors_)
           throw std::runtime_error("No inputs provided.");
 
-        generator_params.params_->SetInputs(*named_tensors->named_tensors_);
+        generator_params.SetInputs(named_tensors);
       })
       .def("set_model_input", &PyGeneratorParams::SetModelInput)
       .def("set_search_options", &PyGeneratorParams::SetSearchOptions)                                     // See config.h 'struct Search' for the options
@@ -449,27 +418,28 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
       .def(pybind11::init([](const std::string& config_path) {
         return CreateModel(GetOrtEnv(), config_path.c_str());
       }))
-      .def("generate", [](Model& model, PyGeneratorParams& params) { params.Prepare(); return Generate(model, params); })
+      .def_property_readonly("type", [](const Model& model) { return model.config_->model.type; })
       .def_property_readonly(
-          "device_type", [](const Model& model) { return to_string(model.device_type_); }, "The device type the model is running on")
+          "device_type", [](const Model& model) { return to_string(model.p_device_->GetType()); }, "The device type the model is running on")
       .def("create_multimodal_processor", [](const Model& model) { return model.CreateMultiModalProcessor(); });
 
   pybind11::class_<PyGenerator>(m, "Generator")
       .def(pybind11::init<Model&, PyGeneratorParams&>())
       .def("is_done", &PyGenerator::IsDone)
-      .def("compute_logits", &PyGenerator::ComputeLogits)
       .def("get_output", &PyGenerator::GetOutput)
+      .def("append_tokens", &PyGenerator::AppendTokens)
       .def("get_logits", &PyGenerator::GetLogits)
       .def("set_logits", &PyGenerator::SetLogits)
       .def("generate_next_token", &PyGenerator::GenerateNextToken)
+      .def("rewind_to", &PyGenerator::RewindToLength)
       .def("get_next_tokens", &PyGenerator::GetNextTokens)
       .def("get_sequence", &PyGenerator::GetSequence)
       .def("set_active_adapter", [](PyGenerator& generator, Adapters* adapters, const std::string& adapter_name) {
         generator.SetActiveAdapter(adapters, adapter_name);
       });
 
-  pybind11::class_<Images>(m, "Images")
-      .def_static("open", [](pybind11::args image_paths) {
+  pybind11::class_<Images, std::shared_ptr<Images>>(m, "Images")
+      .def_static("open", [](pybind11::args image_paths) -> std::shared_ptr<Images> {
         if (image_paths.empty())
           throw std::runtime_error("No images provided");
 
@@ -482,7 +452,7 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
           image_paths_vector.push_back(image_paths_string.back().c_str());
         }
 
-        return LoadImages(image_paths_vector);
+        return std::shared_ptr<Images>(LoadImages(image_paths_vector));
       })
       .def_static("open_bytes", [](pybind11::args image_datas) {
         if (image_datas.empty())
@@ -498,10 +468,10 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
           image_raw_data[i] = ort_extensions::ImageRawData(data, data + info.size);
         }
 
-        return std::make_unique<Images>(std::move(image_raw_data), image_datas.size());
+        return std::make_shared<Images>(std::move(image_raw_data), image_datas.size());
       });
 
-  pybind11::class_<Audios>(m, "Audios")
+  pybind11::class_<Audios, std::shared_ptr<Audios>>(m, "Audios")
       .def_static("open", [](pybind11::args audio_paths) {
         if (audio_paths.empty())
           throw std::runtime_error("No audios provided");
@@ -516,14 +486,14 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
           audio_paths_vector.push_back(audio_paths_string.back().c_str());
         }
 
-        return LoadAudios(audio_paths_vector);
+        return std::shared_ptr<Audios>(LoadAudios(audio_paths_vector));
       });
 
-  pybind11::class_<PyNamedTensors>(m, "NamedTensors");
+  pybind11::class_<PyNamedTensors, std::shared_ptr<PyNamedTensors>>(m, "NamedTensors");
 
   pybind11::class_<MultiModalProcessor, std::shared_ptr<MultiModalProcessor>>(m, "MultiModalProcessor")
       .def(
-          "__call__", [](MultiModalProcessor& processor, const std::optional<std::string>& prompt, const pybind11::kwargs& kwargs) -> std::unique_ptr<PyNamedTensors> {
+          "__call__", [](MultiModalProcessor& processor, const std::optional<std::string>& prompt, const pybind11::kwargs& kwargs) -> std::shared_ptr<PyNamedTensors> {
             if (kwargs.contains("images")) {
               if (processor.image_processor_ == nullptr) {
                 throw std::runtime_error("Image processor is not available for this model.");
@@ -532,11 +502,11 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
               if (!prompt.has_value()) {
                 throw std::runtime_error("Prompt is required for processing the image.");
               }
-              return std::make_unique<PyNamedTensors>(
+              return std::make_shared<PyNamedTensors>(
                   processor.image_processor_->Process(*processor.tokenizer_, *prompt, images));
             } else if (kwargs.contains("audios")) {
               const Audios* audios = kwargs["audios"].cast<const Audios*>();
-              return std::make_unique<PyNamedTensors>(
+              return std::make_shared<PyNamedTensors>(
                   processor.audio_processor_->Process(audios));
             } else {
               throw std::runtime_error("Nothing to process.");
@@ -559,7 +529,8 @@ PYBIND11_MODULE(onnxruntime_genai, m) {
   m.def("is_cuda_available", []() { return USE_CUDA != 0; });
   m.def("is_dml_available", []() { return USE_DML != 0; });
   m.def("is_rocm_available", []() { return USE_ROCM != 0; });
-  m.def("is_webgpu_available", []() { return USE_WEBGPU != 0; });
+  m.def("is_webgpu_available", []() { return true; });
+  m.def("is_qnn_available", []() { return true; });
 
   m.def("set_current_gpu_device_id", [](int device_id) { Ort::SetCurrentGpuDeviceId(device_id); });
   m.def("get_current_gpu_device_id", []() { return Ort::GetCurrentGpuDeviceId(); });

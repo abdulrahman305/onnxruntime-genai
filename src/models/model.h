@@ -7,30 +7,20 @@
 #include "prompt_image_processor.h"
 #include "audio_processor.h"
 #include "adapters.h"
-
-#if USE_DML
-#include "dml_provider_factory.h"
-#include "../dml/dml_helpers.h"
-#include "../dml/dml_execution_context.h"
-#include "../dml/dml_pooled_upload_heap.h"
-#include "../dml/dml_readback_heap.h"
-#endif
+#include "extra_outputs.h"
 
 namespace Generators {
 
 struct Tokenizer;
 
-void ConvertFp16ToFp32(OrtAllocator& allocator, OrtValue& in, std::unique_ptr<OrtValue>& p_out, DeviceType device_type, cudaStream_t stream);
-
-void ConvertFp32ToFp16(OrtAllocator& allocator, OrtValue& in, std::unique_ptr<OrtValue>& p_out, DeviceType device_type, cudaStream_t stream);
-
+void Cast(OrtValue& input, std::unique_ptr<OrtValue>& output, DeviceInterface& device, ONNXTensorElementDataType type);
 void CheckResult(extError_t error);
 
 struct State {
   State(const GeneratorParams& params, const Model& model_);
   virtual ~State();
 
-  virtual DeviceSpan<float> Run(int current_length, DeviceSpan<int32_t> next_tokens, DeviceSpan<int32_t> next_indices = {}) = 0;
+  virtual DeviceSpan<float> Run(int total_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices = {}) = 0;
   virtual const CapturedGraphInfo* GetCapturedGraphInfo() const { return nullptr; }
   virtual void Finalize() {}
 
@@ -38,6 +28,8 @@ struct State {
   void UnsetTerminate();
   mutable bool session_terminated_{};
   OrtValue* GetInput(const char* name);
+
+  virtual void RewindTo(size_t index) { (void)index; };
 
   virtual OrtValue* GetOutput(const char* name);
 
@@ -62,6 +54,7 @@ struct State {
  private:
   int current_batch_size_{0};
   std::shared_ptr<Adapters> adapters_;
+  ExtraOutputs extra_outputs_;
 };
 
 struct TokenizerStream : LeakChecked<TokenizerStream> {
@@ -120,6 +113,8 @@ struct SessionInfo {
   ONNXTensorElementDataType GetInputDataType(const std::string& name) const;
   ONNXTensorElementDataType GetOutputDataType(const std::string& name) const;
 
+  std::vector<std::string> GetInputNames() const;
+
  private:
   std::unordered_map<std::string, ONNXTensorElementDataType> inputs_, outputs_;
 };
@@ -143,25 +138,15 @@ struct Model : std::enable_shared_from_this<Model>, LeakChecked<Model> {
   std::unique_ptr<Config> config_;
   std::unique_ptr<OrtSessionOptions> session_options_;
 
-  cudaStream_t cuda_stream_{};
-  DeviceInterface* p_device_{};
-  DeviceType device_type_{DeviceType::CPU};
-  Ort::Allocator& allocator_cpu_{Ort::Allocator::GetWithDefaultOptions()};
-  Ort::Allocator* allocator_device_{};   // Can be CUDA or CPU based on the DeviceType in the model
-  Ort::Allocator* allocator_kvcache_{};  // keep allocator for kv_cache seperate to allow that only kv_cache is on device
+  mutable DeviceInterface* p_device_{};          // The device we're running on (matches device_type_) used for things that work the same on all devices
+  mutable DeviceInterface* p_device_inputs_{};   // For some model inputs, the device might be the CPU device (all but KV cache currently for WebGPU and DML)
+  mutable DeviceInterface* p_device_kvcache_{};  // The kvcache is always allocated in device memory  (TODO: Remove in favor of just p_device_?)
+
+  Ort::Allocator& allocator_cpu_{GetDeviceInterface(DeviceType::CPU)->GetAllocator()};
 
   std::unique_ptr<SessionInfo> session_info_;
 
   std::shared_ptr<Model> external_owner_;  // Set to 'this' when created by the C API to preserve lifetime
-
-#if USE_DML
-  DmlExecutionContext* GetDmlExecutionContext() const { return dml_execution_context_.get(); }
-  DmlReadbackHeap* GetDmlReadbackHeap() const { return dml_readback_heap_.get(); }
-  DmlPooledUploadHeap* GetDmlUploadHeap() const { return dml_pooled_upload_heap_.get(); }
-  const OrtDmlApi* GetOrtDmlApi() const { return p_dml_api_; }
-  IDMLDevice* GetDmlDevice() const { return dml_device_.Get(); }
-  ID3D12Device* GetD3D12Device() const { return dml_objects_.d3d12_device.Get(); }
-#endif
 
  protected:
   void InitDeviceAllocator(OrtSession& session);
@@ -172,22 +157,6 @@ struct Model : std::enable_shared_from_this<Model>, LeakChecked<Model> {
                                       bool is_primary_session_options,
                                       bool disable_graph_capture);
 
-#if USE_DML
-  mutable DmlObjects dml_objects_;
-  const OrtDmlApi* p_dml_api_{};
-  std::unique_ptr<DmlPooledUploadHeap> dml_pooled_upload_heap_;
-  std::unique_ptr<DmlExecutionContext> dml_execution_context_;
-  std::unique_ptr<DmlReadbackHeap> dml_readback_heap_;
-  ComPtr<IDMLDevice> dml_device_;
-  std::unique_ptr<Ort::Allocator> dml_owned_allocator_;
-#endif
-#if USE_WEBGPU
-  std::unique_ptr<Ort::Allocator> webgpu_owned_allocator_;
-  std::unique_ptr<OrtIoBinding> webgpu_io_binding_;
-#endif
-#if USE_DML || USE_WEBGPU
-  std::unique_ptr<OrtMemoryInfo> memory_info_device_;
-#endif
   std::shared_ptr<CapturedGraphPool> captured_graph_pool_;
   std::map<std::string, std::unique_ptr<OrtSessionOptions>> pipeline_session_options_;
 };

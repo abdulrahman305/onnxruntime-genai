@@ -102,11 +102,6 @@ sourceSets.main.java {
 
 // expects
 sourceSets.test {
-	// add test resource files
-	resources.srcDirs += [
-		"../../test/test_models"
-	]
-
 	if (cmakeNativeLibDir != null) {
 		// add compiled native libs
 		resources.srcDirs += [cmakeNativeLibDir]
@@ -153,6 +148,7 @@ if (cmakeNativeLibDir != null) {
 
 dependencies {
 	testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
+	testImplementation 'org.junit.platform:junit-platform-launcher:1.10.1'
 	testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
 }
 

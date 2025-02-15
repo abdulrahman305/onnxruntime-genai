@@ -9,10 +9,13 @@ namespace Generators {
 struct Logits {
   Logits(State& state);
 
+  // Register input_ids as ORT session input.
   void Add();
+  // For first iteration, find last token of each beam and store it in output_last_tokens_.
   DeviceSpan<float> Get();
 
-  void Update();
+  // Resize logits to [bz, token_count, vocab_size] if necessary.
+  void Update(const DeviceSpan<int32_t>& next_tokens, size_t new_kv_length);
 
  private:
   void HandleEOSArray(std::span<float> logits);
@@ -32,21 +35,11 @@ struct Logits {
 
   std::unique_ptr<OrtValue> output_raw_;  // Raw logits output from model
 
+  std::vector<int> input_sequence_lengths;
   // OrtValue wrapped in a DeviceMemory object to make it universal
   DeviceSpan<float> logits_;
 
-  // Used for decoding runs with cuda graphs.
-  StaticBuffer* sb_logits32_{};
-  StaticBuffer* sb_logits16_{};
-
-#if USE_CUDA
   DeviceSpan<int32_t> cuda_eos_token_ids_;  // eos_token_ids from params, but in cuda accessible memory
-#endif
-
-#if USE_DML
-  DmlReusedCommandListState logits_cast_command_list_state_{};
-  std::unique_ptr<OrtValue> value32_cpu_;
-#endif
 };
 
 }  // namespace Generators

@@ -6,12 +6,14 @@
 #include "models/env_utils.h"
 #include "models/model.h"
 #include "models/decoder_only.h"
+#include "constrained_logits_processor.h"
 #include "search.h"
 #include "cpu/interface.h"
 #include "cuda/interface.h"
 #include "dml/interface.h"
 #include "qnn/interface.h"
 #include "webgpu/interface.h"
+#include "openvino/interface.h"
 
 #if defined(_WIN32)
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
@@ -30,6 +32,8 @@ std::string CurrentModulePath() {
 
   return out_path;
 }
+
+#include "dll_load_error.h"
 #endif
 
 void ThrowErrorIfSessionTerminated(bool is_session_terminated) {
@@ -58,11 +62,10 @@ OrtGlobals::OrtGlobals()
 }
 
 // Ensure Shutdown() has been called before process exit
-struct ValidateShutdown {
-  ~ValidateShutdown() {
+struct EnsureShutdown {
+  ~EnsureShutdown() {
     if (GetOrtGlobals()) {
-      std::cerr << "OGA Error: Shutdown must be called before process exit, please check the documentation for the proper API to call to ensure clean shutdown." << std::endl;
-      std::abort();
+      Shutdown();
     }
   }
 };
@@ -70,7 +73,7 @@ struct ValidateShutdown {
 std::unique_ptr<OrtGlobals>&
 GetOrtGlobals() {
   static auto globals = std::make_unique<OrtGlobals>();
-  static auto validate = std::make_unique<ValidateShutdown>();  // Must be after the above line so the destructor runs before the above destructor
+  static auto validate = std::make_unique<EnsureShutdown>();  // Must be after the above line so the destructor runs before the above destructor
   return globals;
 }
 
@@ -84,7 +87,6 @@ bool LeakTypeList<Types...>::Dump() {
 void Shutdown() {
   if (LeakTypes::Dump()) {
     std::cerr << "    Please see the documentation for the API being used to ensure proper cleanup." << std::endl;
-    std::abort();
   }
 
   GetOrtGlobals().reset();  // Delete now because on process exit is too late
@@ -128,37 +130,76 @@ struct GenaiInterfaceImpl : GenaiInterface {
   void Sequences_RewindTo(Sequences* p_this, size_t new_length) override { return p_this->RewindTo(new_length); }
 } g_genai;
 
-DeviceInterface* GetCudaInterface() {
-// Load the shared library onnxruntime-genai-cuda.dll
-// This is a workaround to avoid linking the CUDA library to the generator library
-// The CUDA library is only needed for the CUDA allocator
 #if defined(_WIN32)
-  static std::unique_ptr<void, void (*)(void*)> cuda_library{LoadLibrary((CurrentModulePath() + "onnxruntime-genai-cuda.dll").c_str()),
-                                                             [](void* h) { FreeLibrary(reinterpret_cast<HMODULE>(h)); }};
-#elif defined(__linux__) && !defined(__ANDROID__)
-  static std::unique_ptr<void, void (*)(void*)> cuda_library{dlopen((Ort::GetCurrentModuleDir() + "/libonnxruntime-genai-cuda.so").c_str(), RTLD_NOW | RTLD_DEEPBIND),
-                                                             [](void* h) { dlclose(h); }};
-#else
-  static std::unique_ptr<void, void (*)(void*)> cuda_library{nullptr, [](void* h) {}};
-#endif
+struct LibraryHandle {
+  LibraryHandle(const char* filename) {
+    auto path = CurrentModulePath() + filename;
+    handle_ = LoadLibrary(path.c_str());
+    if (!handle_)
+      throw std::runtime_error(std::string("Failed to load library: ") + DetermineLoadLibraryError(filename));
+  };
 
-  if (!cuda_library) {
-    throw std::runtime_error("Cuda interface not available.");
+  ~LibraryHandle() { FreeLibrary(handle_); }
+
+  FARPROC __stdcall GetSymbol(const char* name) { return ::GetProcAddress(handle_, name); }
+
+  operator HANDLE() { return handle_; }
+
+ private:
+  HMODULE handle_{};
+};
+#elif defined(__linux__) && !defined(__ANDROID__)
+struct LibraryHandle {
+  LibraryHandle(const char* filename) {
+    auto path = Ort::GetCurrentModuleDir() + "/" + filename;
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!handle_)
+      throw std::runtime_error(std::string("Failed to load library: ") + dlerror());  // dlerror() includes the path
+  }
+  ~LibraryHandle() {
+    dlclose(handle_);
   }
 
-  Generators::DeviceInterface* GetInterface(GenaiInterface * p_genai);
-  static DeviceInterface* cuda_interface{[] {
-#if defined(_WIN32)
-    auto get_cuda_fn = reinterpret_cast<decltype(&GetInterface)>(GetProcAddress(reinterpret_cast<HMODULE>(cuda_library.get()), "GetInterface"));
-#elif defined(__linux__) && !defined(__ANDROID__)
-    auto get_cuda_fn = reinterpret_cast<decltype(&GetInterface)>(dlsym(cuda_library.get(), "GetInterface"));
-#else
-    auto get_cuda_fn = [](GenaiInterface*) { return nullptr; };
-#endif
-    return get_cuda_fn(&g_genai);
-  }()};
+  void* GetSymbol(const char* name) { return ::dlsym(handle_, name); }
 
-  return cuda_interface;
+  operator void*() { return handle_; }
+
+ private:
+  void* handle_{};
+};
+#else
+struct LibraryHandle {
+  LibraryHandle(const char* filename) {}
+  ~LibraryHandle() {}
+
+  void* GetSymbol(const char* name) { return nullptr; }
+
+  operator bool() { return false; }
+};
+#endif
+
+DeviceInterface* GetCudaInterface(DeviceType type) {
+  assert(type == DeviceType::NvTensorRtRtx || type == DeviceType::CUDA);
+  try {
+#if defined(_WIN32)
+    static LibraryHandle library{"onnxruntime-genai-cuda.dll"};
+#elif defined(__linux__) && !defined(__ANDROID__)
+    static LibraryHandle library{"libonnxruntime-genai-cuda.so"};
+#else
+    static LibraryHandle library{""};
+#endif
+    if (!library)
+      throw std::runtime_error("Shared library load failure (see first error)");
+
+    Generators::DeviceInterface* GetInterface(GenaiInterface * p_genai, const char* deviceType);
+    static DeviceInterface* cuda_interface =
+        reinterpret_cast<decltype(&GetInterface)>(
+            library.GetSymbol("GetInterface"))(&g_genai, to_string(type).c_str());
+
+    return cuda_interface;
+  } catch (const std::exception& e) {
+    throw std::runtime_error("Cuda interface not available: " + std::string(e.what()));
+  }
 }
 
 std::string to_string(DeviceType device_type) {
@@ -170,9 +211,13 @@ std::string to_string(DeviceType device_type) {
     case DeviceType::DML:
       return "DirectML";
     case DeviceType::WEBGPU:
-      return "WebGpu";
+      return "WebGPU";
     case DeviceType::QNN:
       return "QnnWithSharedMemory";
+    case DeviceType::OpenVINO:
+      return "OpenVINO";
+    case DeviceType::NvTensorRtRtx:
+      return "NvTensorRtRtx";
     default:
       throw std::runtime_error("Unknown device type");
   }
@@ -184,7 +229,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
     case DeviceType::CPU:
       return GetCpuInterface();
     case DeviceType::CUDA:
-      return GetCudaInterface();
+    case DeviceType::NvTensorRtRtx:
+      return GetCudaInterface(type);
 #if USE_DML
     case DeviceType::DML:
       return GetDmlInterface();
@@ -193,6 +239,8 @@ DeviceInterface* GetDeviceInterface(DeviceType type) {
       return GetWebGPUInterface();
     case DeviceType::QNN:
       return GetQNNInterface();
+    case DeviceType::OpenVINO:
+      return GetOpenVINOInterface();
   }
 }
 
@@ -203,28 +251,11 @@ GeneratorParams::GeneratorParams(const Config& config)
 
 GeneratorParams::GeneratorParams(const Model& model)
     : config{*model.config_.get()},
-      p_device{model.p_device_inputs_},
-      is_cuda_graph_enabled_{IsCudaGraphEnabled(model.config_->model.decoder.session_options)} {
-  use_cuda_graph = is_cuda_graph_enabled_;
-  if (use_cuda_graph) {
+      use_graph_capture{IsGraphCaptureEnabled(model.config_->model.decoder.session_options)},
+      use_multi_profile{IsMultiProfileEnabled(model.config_->model.decoder.session_options)},
+      p_device{model.p_device_inputs_} {
+  if (use_graph_capture) {
     max_batch_size = 1;  // set it to 1 by default
-  }
-}
-
-void GeneratorParams::TryGraphCapture(int max_bs) {
-  if (!is_cuda_graph_enabled_ || p_device->GetType() == DeviceType::CPU) {
-    // no-op
-    return;
-  }
-
-  if (DeviceType::CUDA == p_device->GetType() || DeviceType::DML == p_device->GetType()) {
-    if (max_bs == 0) {
-      throw std::runtime_error("Graph capture is enabled, but max_batch_size is not set.");
-    }
-    use_cuda_graph = true;
-    max_batch_size = max_bs;
-  } else {
-    throw std::runtime_error("CUDA graph is not supported on this device");
   }
 }
 
@@ -247,6 +278,11 @@ void GeneratorParams::SetInputs(const NamedTensors& named_tensors) {
       extra_inputs.push_back({graph_name, tensor});
     }
   }
+}
+
+void GeneratorParams::SetGuidance(std::string_view type, std::string_view data) {
+  guidance_type = type;
+  guidance_data = data;
 }
 
 std::unique_ptr<Generator> CreateGenerator(const Model& model, const GeneratorParams& params) {
@@ -272,6 +308,7 @@ Generator::Generator(const Model& model, const GeneratorParams& params) : model_
   search_ = CreateSearch(params);
   state_ = model.CreateState(search_->GetSequenceLengths(), params);  // Search sequence lengths set when creating state
 
+  guidance_logits_processor_ = CreateGuidanceLogitsProcessor(*state_);  // Could be nullptr if use_guidance (constrained decoding) is not used
   // Temporary solution for multimodal and whisper models
   if (!params.aux_input_ids.empty() && params.aux_input_ids.data() != nullptr) {
     AuxAppendTokens(params.aux_input_ids);
@@ -286,10 +323,17 @@ DeviceSpan<int32_t> Generator::AllocateInputIdsOnDevice(cpu_span<const int32_t> 
     const auto window_size = model_->config_->model.decoder.sliding_window->window_size;
     padded_input_ids_size = ((input_ids.size() + window_size - 1) / window_size) * window_size;
   }
+
   auto input_ids_device = state_->params_->p_device->Allocate<int32_t>(padded_input_ids_size);
   auto cpu_span = input_ids_device.CpuSpan();
-  std::fill_n(cpu_span.begin(), padded_input_ids_size - input_ids.size(), model_->config_->model.pad_token_id);
-  std::copy_backward(input_ids.begin(), input_ids.end(), cpu_span.end());
+  auto padding_begin = cpu_span.begin();
+  auto data_end = cpu_span.end();
+  if (model_->config_->model.decoder.sliding_window.has_value() && model_->config_->model.decoder.sliding_window->alignment == "left") {
+    padding_begin = cpu_span.begin() + input_ids.size();
+    data_end = padding_begin;
+  }
+  std::fill_n(padding_begin, padded_input_ids_size - input_ids.size(), model_->config_->model.pad_token_id);
+  std::copy_backward(input_ids.begin(), input_ids.end(), data_end);
   input_ids_device.CopyCpuToDevice();
   return input_ids_device;
 }
@@ -322,8 +366,9 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
   constexpr std::array<DeviceType, 3> devices_supporting_continuous_decoding{DeviceType::CPU, DeviceType::CUDA, DeviceType::WEBGPU};
   if (search_->GetSequenceLength() != 0 &&
       std::none_of(devices_supporting_continuous_decoding.begin(), devices_supporting_continuous_decoding.end(),
-                   [this](DeviceType device_type) { return device_type == state_->params_->p_device->GetType(); }))
-    throw std::runtime_error("Continuous decoding is not supported on the selected device type (" + to_string(state_->params_->p_device->GetType()) +
+                   [this](DeviceType device_type) { return device_type == state_->model_.p_device_kvcache_->GetType(); }))
+    // Support for continuous decoding should be based on the type of device used for KV cache
+    throw std::runtime_error("Continuous decoding is not supported on the selected device type (" + to_string(state_->model_.p_device_kvcache_->GetType()) +
                              "). Please recreate the generator instance to avoid using continuous decoding.");
 
   if (last_action_ == Action::generated) {
@@ -339,11 +384,14 @@ void Generator::AppendTokens(cpu_span<const int32_t> input_ids) {
 void Generator::ComputeLogits(DeviceSpan<int32_t> next_tokens) {
   if (computed_logits_)
     throw std::runtime_error("ComputeLogits called again without calling AppendTokens or GenerateNextToken first");
-
+  if (last_action_ == Action::generated && guidance_logits_processor_) {
+    auto next_tokens_span = next_tokens.CopyDeviceToCpu();
+    guidance_logits_processor_->CommitTokens(next_tokens_span);
+  }
   auto logits = state_->Run(search_->GetSequenceLength(), next_tokens, search_->GetNextIndices());
   if (g_log.enabled && g_log.model_logits) {
     auto& stream = Log("model_logits");
-    DumpSpan(stream, logits.CopyDeviceToCpu());
+    DumpValues(stream, Ort::TypeToTensorType<float>, logits.CopyDeviceToCpu().data(), logits.size());
     stream << std::endl;
   }
   SetLogits(logits);
@@ -415,6 +463,10 @@ void Generator::GenerateNextToken() {
       search_->AppendTokens(next_tokens);
     ComputeLogits(next_tokens);
   }
+  if (guidance_logits_processor_) {
+    auto logits = GetLogits();
+    guidance_logits_processor_->ProcessLogits(logits);
+  }
   computed_logits_ = false;
   auto& search = search_->params_->search;
   search_->ApplyMinLength(search.min_length);
@@ -431,7 +483,7 @@ void Generator::GenerateNextToken() {
   }
 
   last_action_ = Action::generated;
-  if (!search.do_sample || search.top_k == 1) {
+  if (!search.do_sample || search.top_k == 1 || search.temperature == 0) {
     search_->SelectTop();
     return;
   }
@@ -445,8 +497,6 @@ void Generator::GenerateNextToken() {
     throw std::runtime_error("top_p must be between 0.0 and 1.0");
   if (search.top_k < 0)
     throw std::runtime_error("top_k must be 0 or greater");
-  if (search.temperature <= 0.0f)
-    throw std::runtime_error("temperature must be greater than 0");
 
   if (search.top_p > 0.0f && search.top_p < 1.0f && search.top_k > 1) {
     search_->SampleTopKTopP(search.top_k, search.top_p, search.temperature);
@@ -470,6 +520,9 @@ void Generator::RewindToLength(size_t new_length) {
     throw std::runtime_error("RewindToLength must be called with new_length=0 when batch_size > 1");
   search_->RewindTo(new_length);
   state_->RewindTo(new_length);
+  if (guidance_logits_processor_) {
+    guidance_logits_processor_->Reset();
+  }
   computed_logits_ = false;
   last_action_ = Action::rewound;
 }

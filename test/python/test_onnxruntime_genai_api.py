@@ -8,6 +8,7 @@ import sys
 import sysconfig
 from pathlib import Path
 import shutil
+import tempfile
 import onnxruntime
 
 import numpy as np
@@ -16,6 +17,8 @@ import pytest
 
 if not sysconfig.get_platform().endswith("arm64"):
     # Skip importing onnx if running on ARM64
+    # TODO(justinchuby): ONNX 1.18 supports arm64. Remove the condition when
+    # there is a version bump
     import onnx
 
 devices = ["cpu"]
@@ -45,6 +48,57 @@ def test_config(test_data_path):
     config.set_provider_option("quantum", "break_universe", "true")
     config.append_provider("slide rule")
 
+def test_log_callback(test_data_path):
+    callback_invoked = False
+
+    def _log_callback(log: str):
+        nonlocal callback_invoked
+        callback_invoked = True
+
+    og.set_log_options(enabled=True, generate_next_token=True)
+    og.set_log_callback(_log_callback)
+
+    model_path = os.fspath(Path(test_data_path) / "hf-internal-testing" / "tiny-random-gpt2-fp32")
+    config = og.Config(model_path)
+    model = og.Model(config)
+
+    search_params = og.GeneratorParams(model)
+    generator = og.Generator(model, search_params)
+    generator.append_tokens(np.array([[0, 0, 0, 52]], dtype=np.int32))
+    generator.generate_next_token()
+
+    assert callback_invoked, "Log callback was not invoked"
+
+    og.set_log_callback(None)
+    og.set_log_options(enabled=False)
+
+def test_log_filename(test_data_path):
+    callback_invoked = False
+
+    def _log_callback(log: str):
+        nonlocal callback_invoked
+        callback_invoked = True
+
+    og.set_log_callback(_log_callback)
+
+    with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False) as log_file:
+        og.set_log_options(enabled=True, generate_next_token=True, filename=log_file.name)
+
+        model_path = os.fspath(Path(test_data_path) / "hf-internal-testing" / "tiny-random-gpt2-fp32")
+        config = og.Config(model_path)
+        model = og.Model(config)
+
+        search_params = og.GeneratorParams(model)
+        generator = og.Generator(model, search_params)
+        generator.append_tokens(np.array([[0, 0, 0, 52]], dtype=np.int32))
+        generator.generate_next_token()
+
+        assert os.path.exists(log_file.name), f"Log file {log_file.name} was not created"
+        assert os.path.getsize(log_file.name) > 0, f"Log file {log_file.name} is empty"
+        assert not callback_invoked, "Log callback was invoked. It should not have been since it was overridden by the log file."
+
+    og.set_log_options(enabled=False, filename="")
+    og.set_log_callback(None)
 
 def test_NamedTensors():
     named_tensors = og.NamedTensors()
@@ -90,8 +144,7 @@ def test_greedy_search(test_data_path, relative_model_path):
     model = og.Model(config)
 
     search_params = og.GeneratorParams(model)
-    input_ids_shape = [2, 4]
-    batch_size = input_ids_shape[0]
+    batch_size = 2
     search_params = og.GeneratorParams(model)
     search_params.set_search_options(
         do_sample=False, max_length=10, batch_size=batch_size
@@ -136,8 +189,7 @@ def test_rewind_cuda(test_data_path, relative_model_path):
     model = og.Model(model_path)
 
     # Batch size 1 (continuous decoding) case
-    input_ids_shape = [1, 4]
-    batch_size = input_ids_shape[0]
+    batch_size = 1
     search_params = og.GeneratorParams(model)
     search_params.set_search_options(
         do_sample=False, max_length=10, batch_size=batch_size
@@ -159,8 +211,7 @@ def test_rewind_cuda(test_data_path, relative_model_path):
     assert generator.get_sequence(0) is not None
 
     # Batch size > 1 case
-    input_ids_shape = [3, 4]
-    batch_size = input_ids_shape[0]
+    batch_size = 3
     search_params = og.GeneratorParams(model)
     search_params.set_search_options(
         do_sample=False, max_length=10, batch_size=batch_size
@@ -204,9 +255,8 @@ def test_rewind(test_data_path, relative_model_path):
         [0, 0, 195, 731, 731, 114, 114, 114, 114, 114],
         dtype=np.int32,
     )
-
-    input_ids_shape = [1, 4]
-    batch_size = input_ids_shape[0]
+    
+    batch_size = 1
     search_params = og.GeneratorParams(model)
     search_params.set_search_options(
         do_sample=False, max_length=10, batch_size=batch_size
@@ -230,12 +280,9 @@ def test_rewind(test_data_path, relative_model_path):
 
 # Test Model Loading with No Chat Template
 
-
-# TODO: CUDA pipelines use python3.6 and do not have a way to download models since downloading models
-# requires pytorch and hf transformers. This test should be re-enabled once the pipeline is updated.
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 @pytest.mark.parametrize("batch", [True, False])
@@ -264,8 +311,8 @@ def test_tokenizer_encode_decode(device, phi2_for, batch):
 
 # Test Chat Template Supported Model
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_phi3_chat_template(device, phi3_for):
@@ -284,8 +331,8 @@ def test_phi3_chat_template(device, phi3_for):
 
 # Test Chat Template Unsupported Model with Template String Override
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_phi2_chat_template(device, phi2_for):
@@ -308,8 +355,8 @@ def test_phi2_chat_template(device, phi2_for):
 
 
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_tokenizer_stream(device, phi2_for):
@@ -331,12 +378,9 @@ def test_tokenizer_stream(device, phi2_for):
 
         assert decoded_string == prompt
 
-
-# TODO: CUDA pipelines use python3.6 and do not have a way to download models since downloading models
-# requires pytorch and hf transformers. This test should be re-enabled once the pipeline is updated.
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_batching(device, phi2_for):
@@ -362,12 +406,9 @@ def test_batching(device, phi2_for):
     for i in range(len(prompts)):
         print(tokenizer.decode(generator.get_sequence(0)))
 
-
-# TODO: CUDA pipelines use python3.6 and do not have a way to download models since downloading models
-# requires pytorch and hf transformers. This test should be re-enabled once the pipeline is updated.
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_e2e(device, phi2_for):
@@ -388,10 +429,37 @@ def test_e2e(device, phi2_for):
     for i in range(len(prompts)):
         print(tokenizer.decode(generator.get_sequence(0)))
 
+@pytest.mark.skipif(
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
+)
+@pytest.mark.parametrize("device", devices)
+@pytest.mark.parametrize("wrapper_bytes_function", [lambda x: x, bytearray, memoryview])
+def test_load_model_from_memory(device, wrapper_bytes_function, phi2_for):
+    model_path = phi2_for(device)
+    config = og.Config(model_path)
+    model_data = None
+    with open(os.path.join(model_path, "model.onnx"), 'rb') as model_file:
+        model_data = wrapper_bytes_function(model_file.read())
 
-def test_logging():
-    og.set_log_options(enabled=True, generate_next_token=True)
+    config.add_model_data("model.onnx", model_data)
+    model = og.Model(config)
+    config.remove_model_data("model.onnx")
+    tokenizer = og.Tokenizer(model)
 
+    prompts = [
+        "This is a test.",
+    ]
+
+    params = og.GeneratorParams(model)
+    params.set_search_options(max_length=20, batch_size=len(prompts))  # To run faster
+
+    generator = og.Generator(model, params)
+    generator.append_tokens(tokenizer.encode_batch(prompts))
+    while not generator.is_done():
+        generator.generate_next_token()
+    for i in range(len(prompts)):
+        print(tokenizer.decode(generator.get_sequence(0)))
 
 @pytest.mark.parametrize(
     "relative_model_path",
@@ -479,8 +547,8 @@ def test_get_output(test_data_path, relative_model_path):
 
 
 @pytest.mark.skipif(
-    sysconfig.get_platform().endswith("arm64") or sys.version_info.minor < 8,
-    reason="Python 3.8 is required for downloading models.",
+    sysconfig.get_platform().endswith("arm64"),
+    reason="Model is not available on arm64.",
 )
 @pytest.mark.parametrize("device", devices)
 def test_hidden_states(qwen_for, device):
@@ -516,6 +584,9 @@ def test_pipeline_model(test_data_path, phi2_for, relative_model_path):
         """Extract a subgraph from the input model and save it to the output path"""
 
         model = onnx.load(input_path)
+        # Add all value info out the model output to value_info list for the
+        # extractor to find the value properly
+        model.graph.value_info.extend(model.graph.output)
 
         e = onnx.utils.Extractor(model)
         extracted = e.extract_model(input_names, output_names)
@@ -878,3 +949,43 @@ def test_preset_extra_inputs(test_data_path, device, phi2_for, extra_inputs):
 
         while not generator.is_done():
             generator.generate_next_token()
+
+
+@pytest.mark.parametrize("relative_model_path", [Path("audio-preprocessing")])
+@pytest.mark.parametrize("relative_audio_path", [Path("audios") / "1272-141231-0002.mp3"])
+def test_audio_preprocessing(test_data_path, relative_model_path, relative_audio_path):
+    model_path = os.fspath(Path(test_data_path) / relative_model_path)
+    model = og.Model(model_path)
+
+    processor = model.create_multimodal_processor()
+
+    audio_paths = [os.fspath(Path(test_data_path) / relative_audio_path)]
+    audios = og.Audios.open(*audio_paths)
+
+    batch_size = len(audio_paths)
+    decoder_prompt_tokens = ["<|startoftranscript|>", "<|en|>", "<|transcribe|>", "<|notimestamps|>"]
+    prompts = ["".join(decoder_prompt_tokens)] * batch_size
+    _ = processor(prompts, audios=audios)
+
+
+@pytest.mark.parametrize("relative_model_path", [Path("audio-preprocessing")])
+@pytest.mark.parametrize(
+    "relative_audio_paths",
+    [[Path("audios") / "1272-141231-0002.mp3"], [Path("audios") / "jfk.flac"]],
+)
+def test_audio_preprocessing_multiple_audios(test_data_path, relative_model_path, relative_audio_paths):
+    model_path = os.fspath(Path(test_data_path) / relative_model_path)
+    model = og.Model(model_path)
+
+    processor = model.create_multimodal_processor()
+
+    audio_paths = [
+        os.fspath(Path(test_data_path) / relative_audio_path)
+        for relative_audio_path in relative_audio_paths
+    ]
+    audios = og.Audios.open(*audio_paths)
+
+    batch_size = len(audio_paths)
+    decoder_prompt_tokens = ["<|startoftranscript|>", "<|en|>", "<|transcribe|>", "<|notimestamps|>"]
+    prompts = ["".join(decoder_prompt_tokens)] * batch_size
+    _ = processor(prompts, audios=audios)

@@ -11,6 +11,7 @@
 
 #include "../generators.h"
 #include "../search.h"
+#include "../tracing.h"
 #include "model.h"
 #include "gpt.h"
 #include "decoder_only.h"
@@ -20,7 +21,54 @@
 #include "decoder_only_pipeline.h"
 #include "../dml/interface.h"
 
+#if defined(_WIN32)
+#include <direct.h>
+#define GETCWD _getcwd
+#define CHDIR _wchdir
+#include <windows.h>
+#else
+#include <unistd.h>
+#define GETCWD getcwd
+#define CHDIR chdir
+#include <limits.h>
+#endif
+
 namespace Generators {
+
+namespace {
+
+class DirGuard {
+ private:
+  fs::path original_dir_;
+
+ public:
+  DirGuard() {
+    char buffer[PATH_MAX];
+    if (GETCWD(buffer, sizeof(buffer))) {
+      original_dir_ = fs::path(buffer);
+    } else {
+      throw std::runtime_error("Failed to get current working directory");
+    }
+  }
+
+  DirGuard(const DirGuard&) = delete;
+  DirGuard& operator=(const DirGuard&) = delete;
+  DirGuard(DirGuard&&) = delete;
+
+  void ChangeTo(const fs::path& new_dir) {
+    if (CHDIR(new_dir.c_str()) != 0) {
+      throw std::runtime_error("Failed to change directory to: " + new_dir.string());
+    }
+  }
+
+  ~DirGuard() {
+    if (CHDIR(original_dir_.c_str()) != 0) {
+      Log("warning", "Failed to change back to original directory: " + original_dir_.string());
+    }
+  }
+};
+
+}  // namespace
 
 State::State(const GeneratorParams& params, const Model& model)
     : model_{model},
@@ -36,7 +84,31 @@ State::State(const GeneratorParams& params, const Model& model)
   }
 }
 
+void State::DumpInputs() {
+  if (g_log.enabled && g_log.model_input_values) {
+    auto& stream = Log("model_input_values");
+    stream << std::endl;
+    DumpTensors(model_, stream, inputs_.data(), input_names_.data(), input_names_.size(), true);
+  }
+
+  if (g_log.enabled && g_log.model_output_shapes) {
+    auto& stream = Log("model_output_shapes");
+    stream << std::endl;
+    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), false);
+  }
+}
+
+void State::DumpOutputs() {
+  if (g_log.enabled && g_log.model_output_values) {
+    auto& stream = Log("model_output_values");
+    stream << std::endl;
+    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), true);
+  }
+}
+
 void State::Run(OrtSession& session, bool graph_capture_this_run) {
+  DurationTrace trace{"State::Run"};
+
   if (params_->use_graph_capture) {
     if (graph_capture_this_run)
       run_options_->AddConfigEntry("gpu_graph_id", graph_id_.c_str());
@@ -58,17 +130,7 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
     }
   }
 
-  if (g_log.enabled && g_log.model_input_values) {
-    auto& stream = Log("model_input_values");
-    stream << std::endl;
-    DumpTensors(model_, stream, inputs_.data(), input_names_.data(), input_names_.size(), true);
-  }
-
-  if (g_log.enabled && g_log.model_output_shapes) {
-    auto& stream = Log("model_output_shapes");
-    stream << std::endl;
-    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), false);
-  }
+  DumpInputs();
 
   if (!ep_dynamic_options_next_run_.empty()) {
     std::vector<const char*> keys;
@@ -86,11 +148,7 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
 
   extra_outputs_.RegisterOutputs();
 
-  if (g_log.enabled && g_log.model_output_values) {
-    auto& stream = Log("model_output_values");
-    stream << std::endl;
-    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), true);
-  }
+  DumpOutputs();
 }
 
 void State::SetTerminate() {
@@ -282,60 +340,30 @@ int32_t Tokenizer::TokenToTokenId(const char* token) const {
 }
 
 /**
- * @brief Creates multi-profile shapes for TensorRT execution provider optimization.
+ * @brief Creates profile shapes for NvTensorRtRtx execution provider optimization.
  *
- * This function generates separate profiles for each of the context and generation phases to optimize performance
- * Each profile includes shapes for input tensors (input_ids, attention_mask, position_ids)
- * and key-value cache tensors with appropriate dimensions based on the model configuration.
+ * This function generates profiles for TensorRT execution provider optimization.
+ * If multi-profile is enabled, it creates separate profiles for context and generation phases.
+ * If multi-profile is disabled, it creates a single profile with simple shapes.
  *
  */
-void ConfigureMultiProfile(const Config& config, OrtSessionOptions& session_options) {
+void ConfigureNvTensorRtRTxProfile(const Config& config, OrtSessionOptions& session_options, bool is_multi_profile_enabled) {
   // Get model parameters from decoder config
   const int num_layers = config.model.decoder.num_hidden_layers;
   const int num_kv_heads = config.model.decoder.num_key_value_heads;
   const int head_dim = config.model.decoder.head_size;
+  const int batch_size = config.search.batch_size;
 
   // Get max context length from config
   const int max_context_len = config.model.context_length;
-  const int opt_context_len = config.model.context_length / 2;
-  const int min_seq_len = 1;
 
   // Extract KV cache name patterns from decoder config
   std::string_view past_key_pattern = config.model.decoder.inputs.past_key_names;
   std::string_view past_value_pattern = config.model.decoder.inputs.past_value_names;
 
-  // Helper function to add input shapes (input_ids, attention_mask, position_ids)
-  const auto add_input_shapes = [](std::ostringstream& shapes, int seq_len, bool append = false) {
-    if (append) shapes << ",";
-    shapes << Config::Defaults::InputIdsName << ":1x" << seq_len << ","
-           << Config::Defaults::AttentionMaskName << ":1x" << seq_len;
-  };
-
-  // Helper function to add generation phase input shapes
-  const auto add_generation_input_shapes = [](std::ostringstream& shapes, int context_len) {
-    shapes << "," << Config::Defaults::AttentionMaskName << ":1x" << context_len << ","
-           << Config::Defaults::InputIdsName << ":1x1";
-  };
-
-  // Helper function to add empty KV cache shapes for all layers
-  const auto add_empty_key_value_cache_shapes = [](std::ostringstream& shapes,
-                                                   std::string_view key_pattern,
-                                                   std::string_view value_pattern,
-                                                   int num_layers,
-                                                   int num_kv_heads,
-                                                   int head_dim) {
-    for (int i = 0; i < num_layers; i++) {
-      // Use the existing function to format the key/value names
-      const std::string key_name = ComposeKeyValueName(std::string(key_pattern), i);
-      const std::string value_name = ComposeKeyValueName(std::string(value_pattern), i);
-
-      shapes << "," << key_name << ":1x" << num_kv_heads << "x0x" << head_dim;
-      shapes << "," << value_name << ":1x" << num_kv_heads << "x0x" << head_dim;
-    }
-  };
-
   // Helper function to add KV cache with sequence length
   const auto add_key_value_cache_shapes = [](std::ostringstream& shapes,
+                                             int batch_size,
                                              std::string_view key_pattern,
                                              std::string_view value_pattern,
                                              int seq_len,
@@ -347,35 +375,100 @@ void ConfigureMultiProfile(const Config& config, OrtSessionOptions& session_opti
       const std::string key_name = ComposeKeyValueName(std::string(key_pattern), i);
       const std::string value_name = ComposeKeyValueName(std::string(value_pattern), i);
 
-      shapes << "," << key_name << ":1x" << num_kv_heads << "x" << seq_len << "x" << head_dim;
-      shapes << "," << value_name << ":1x" << num_kv_heads << "x" << seq_len << "x" << head_dim;
+      shapes << "," << key_name << ":" << batch_size << "x" << num_kv_heads << "x" << seq_len << "x" << head_dim;
+      shapes << "," << value_name << ":" << batch_size << "x" << num_kv_heads << "x" << seq_len << "x" << head_dim;
     }
   };
 
-  std::ostringstream min_shapes, opt_shapes, max_shapes;
+  if (is_multi_profile_enabled) {
+    // Multi-profile mode: existing logic for context and generation phases
+    const int opt_context_len = config.model.context_length / 2;
+    const int min_seq_len = 1;
 
-  // MIN SHAPES (context phase and first token generation)
-  add_input_shapes(min_shapes, min_seq_len);
-  add_empty_key_value_cache_shapes(min_shapes, past_key_pattern, past_value_pattern, num_layers, num_kv_heads, head_dim);
-  add_generation_input_shapes(min_shapes, min_seq_len);
-  add_key_value_cache_shapes(min_shapes, past_key_pattern, past_value_pattern, min_seq_len, num_layers, num_kv_heads, head_dim);
+    // Helper function to add input shapes (input_ids, attention_mask, position_ids)
+    const auto add_input_shapes = [](std::ostringstream& shapes, int batch_size, int seq_len, bool append = false) {
+      if (append) shapes << ",";
+      shapes << Config::Defaults::InputIdsName << ":" << batch_size << "x" << seq_len << ","
+             << Config::Defaults::AttentionMaskName << ":" << batch_size << "x" << seq_len;
+    };
 
-  // OPT SHAPES (prefill with medium context and generation after medium context)
-  add_input_shapes(opt_shapes, opt_context_len);
-  add_empty_key_value_cache_shapes(opt_shapes, past_key_pattern, past_value_pattern, num_layers, num_kv_heads, head_dim);
-  add_generation_input_shapes(opt_shapes, opt_context_len);
-  add_key_value_cache_shapes(opt_shapes, past_key_pattern, past_value_pattern, opt_context_len - 1, num_layers, num_kv_heads, head_dim);
+    // Helper function to add generation phase input shapes
+    const auto add_generation_input_shapes = [](std::ostringstream& shapes, int batch_size, int context_len) {
+      shapes << "," << Config::Defaults::AttentionMaskName << ":" << batch_size << "x" << context_len << ","
+             << Config::Defaults::InputIdsName << ":" << batch_size << "x1";
+    };
 
-  // MAX SHAPES (prefill with maximum context and generation after maximum context)
-  add_input_shapes(max_shapes, max_context_len);
-  add_key_value_cache_shapes(max_shapes, past_key_pattern, past_value_pattern, max_context_len - 1, num_layers, num_kv_heads, head_dim);
-  add_generation_input_shapes(max_shapes, max_context_len);
-  add_key_value_cache_shapes(max_shapes, past_key_pattern, past_value_pattern, max_context_len - 1, num_layers, num_kv_heads, head_dim);
+    // Helper function to add empty KV cache shapes for all layers
+    const auto add_empty_key_value_cache_shapes = [](std::ostringstream& shapes,
+                                                     int batch_size,
+                                                     std::string_view key_pattern,
+                                                     std::string_view value_pattern,
+                                                     int num_layers,
+                                                     int num_kv_heads,
+                                                     int head_dim) {
+      for (int i = 0; i < num_layers; i++) {
+        // Use the existing function to format the key/value names
+        const std::string key_name = ComposeKeyValueName(std::string(key_pattern), i);
+        const std::string value_name = ComposeKeyValueName(std::string(value_pattern), i);
 
-  // Add the constructed profiles to session options
-  session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_min_shapes", min_shapes.str().c_str());
-  session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_opt_shapes", opt_shapes.str().c_str());
-  session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_max_shapes", max_shapes.str().c_str());
+        shapes << "," << key_name << ":" << batch_size << "x" << num_kv_heads << "x0x" << head_dim;
+        shapes << "," << value_name << ":" << batch_size << "x" << num_kv_heads << "x0x" << head_dim;
+      }
+    };
+
+    std::ostringstream min_shapes, opt_shapes, max_shapes;
+
+    // MIN SHAPES (context phase and first token generation)
+    add_input_shapes(min_shapes, batch_size, min_seq_len);
+    add_empty_key_value_cache_shapes(min_shapes, batch_size, past_key_pattern, past_value_pattern, num_layers, num_kv_heads, head_dim);
+    add_generation_input_shapes(min_shapes, batch_size, min_seq_len);
+    add_key_value_cache_shapes(min_shapes, batch_size, past_key_pattern, past_value_pattern, min_seq_len, num_layers, num_kv_heads, head_dim);
+
+    // OPT SHAPES (prefill with medium context and generation after medium context)
+    add_input_shapes(opt_shapes, batch_size, opt_context_len);
+    add_empty_key_value_cache_shapes(opt_shapes, batch_size, past_key_pattern, past_value_pattern, num_layers, num_kv_heads, head_dim);
+    add_generation_input_shapes(opt_shapes, batch_size, opt_context_len);
+    add_key_value_cache_shapes(opt_shapes, batch_size, past_key_pattern, past_value_pattern, opt_context_len - 1, num_layers, num_kv_heads, head_dim);
+
+    // MAX SHAPES (prefill with maximum context and generation after maximum context)
+    add_input_shapes(max_shapes, batch_size, max_context_len);
+    add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len - 1, num_layers, num_kv_heads, head_dim);
+    add_generation_input_shapes(max_shapes, batch_size, max_context_len);
+    add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len - 1, num_layers, num_kv_heads, head_dim);
+
+    // Add the constructed profiles to session options
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_min_shapes", min_shapes.str().c_str());
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_opt_shapes", opt_shapes.str().c_str());
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_max_shapes", max_shapes.str().c_str());
+  } else {
+    // Single profile mode: simple shapes with batch_dim=[1,1,batch_size] and seq_dim=[1,1024,max_context_len]
+    std::ostringstream min_shapes, opt_shapes, max_shapes;
+
+    // MIN SHAPES: batch_dim=1, seq_dim=1
+    constexpr int min_context_len = 1;
+    constexpr int min_batch_size = 1;
+    min_shapes << Config::Defaults::InputIdsName << ":" << min_batch_size << "x" << min_context_len << ","
+               << Config::Defaults::AttentionMaskName << ":" << min_batch_size << "x" << min_context_len;
+    add_key_value_cache_shapes(min_shapes, min_batch_size, past_key_pattern, past_value_pattern, 0, num_layers, num_kv_heads, head_dim);
+
+    // OPT SHAPES: batch_dim=1, seq_dim=1024
+    const int opt_context_len = std::min(max_context_len / 2, 1024);  // Use a reasonable opt context length
+    constexpr int opt_batch_size = 1;                                 // Use a opt batch size of 1
+    // keeping seq length to 1 as optimizing for the gen phase
+    opt_shapes << Config::Defaults::InputIdsName << ":" << opt_batch_size << "x" << 1 << ","
+               << Config::Defaults::AttentionMaskName << ":" << opt_batch_size << "x" << opt_context_len;
+    add_key_value_cache_shapes(opt_shapes, opt_batch_size, past_key_pattern, past_value_pattern, opt_context_len, num_layers, num_kv_heads, head_dim);
+
+    // MAX SHAPES: seq_dim=max_context_len
+    max_shapes << Config::Defaults::InputIdsName << ":" << batch_size << "x" << max_context_len << ","
+               << Config::Defaults::AttentionMaskName << ":" << batch_size << "x" << max_context_len;
+    add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len, num_layers, num_kv_heads, head_dim);
+
+    // Add the constructed profiles to session options
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_min_shapes", min_shapes.str().c_str());
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_opt_shapes", opt_shapes.str().c_str());
+    session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_max_shapes", max_shapes.str().c_str());
+  }
 }
 
 DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
@@ -439,6 +532,8 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
       if (!GetDmlInterface()) {
         LUID device_luid{};
         LUID* p_device_luid{};
+        uint32_t device_index{};
+        uint32_t* p_device_index{};
         for (const auto& [name, value] : provider_options.options) {
           if (name == "luid") {
             if (auto separator_position = value.find(":"); separator_position != std::string::npos) {
@@ -446,15 +541,17 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
               device_luid.LowPart = std::stol(value.substr(separator_position + 1));
               p_device_luid = &device_luid;
             }
+          } else if (name == "device_index") {
+            device_index = std::stoi(value);
+            p_device_index = &device_index;
           }
         }
 
-        InitDmlInterface(p_device_luid);
+        InitDmlInterface(p_device_luid, p_device_index);
       }
 
       if (!disable_graph_capture) {
         session_options.AddConfigEntry("ep.dml.enable_graph_capture", "1");
-        session_options.AddConfigEntry("ep.dml.disable_memory_arena", "1");
       }
 
       SetDmlProvider(session_options);
@@ -484,8 +581,10 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
         session_options.AddConfigEntry("session.inter_op.allow_spinning", "0");
         session_options.AddConfigEntry("session.intra_op.allow_spinning", "0");
       } else if (provider_options.name == "NvTensorRtRtx") {
-        if (IsMultiProfileEnabled(config.model.decoder.session_options)) {
-          ConfigureMultiProfile(config, session_options);
+        bool is_multi_profile_enabled = IsMultiProfileEnabled(config.model.decoder.session_options);
+        ConfigureNvTensorRtRTxProfile(config, session_options, is_multi_profile_enabled);
+        if (IsGraphCaptureEnabled(config.model.decoder.session_options)) {
+          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_cuda_graph_enable", "1");
         }
         p_device = GetDeviceInterface(DeviceType::NvTensorRtRtx);
       }
@@ -634,8 +733,8 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
   CreateSessionOptions();
   EnsureDeviceOrtInit(*p_device_, *config_);
 
-  // Only CUDA and DML does every input on the device
-  if (p_device_->GetType() == DeviceType::CUDA || p_device_->GetType() == DeviceType::DML)
+  // Only CUDA, TRT-RTX and DML does every input on the device
+  if (p_device_->GetType() == DeviceType::CUDA || p_device_->GetType() == DeviceType::DML || p_device_->GetType() == DeviceType::NvTensorRtRtx)
     p_device_inputs_ = p_device_;
   else
     p_device_inputs_ = GetDeviceInterface(DeviceType::CPU);
@@ -644,7 +743,21 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
   p_device_kvcache_ = p_device_;
 }
 
-Model::~Model() = default;
+Model::~Model() {
+#if USE_DML
+  if (p_device_->GetType() == DeviceType::DML) {
+    auto& allocator = GetOrtGlobals()->device_allocators_[static_cast<int>(DeviceType::DML)];
+    allocator.session_.reset();
+    allocator.allocator_.reset();
+    session_options_.reset();
+    // DML objects are globally scoped and launch background threads that retain hardware resources.
+    // These threads persist beyond the lifetime of a Model, preventing proper cleanup and potentially causing deadlocks.
+    // To avoid blocking driver threads, we explicitly destroy DML objects when the Model is destroyed.
+    // They will be recreated as needed when a new Model is initialized.
+    CloseDmlInterface();
+  }
+#endif
+}
 
 void Model::CreateSessionOptionsFromConfig(const Config::SessionOptions& config_session_options,
                                            OrtSessionOptions& session_options,
@@ -782,6 +895,34 @@ OrtSessionOptions* Model::GetSessionOptions(const std::string& model_id) const {
   return session_options_.get();
 }
 
+std::unique_ptr<OrtSession> Model::CreateSession(OrtEnv& ort_env, const std::string& model_filename, OrtSessionOptions* session_options) {
+  if (auto model_data_it = config_->model_data_spans_.find(model_filename);
+      model_data_it != config_->model_data_spans_.end()) {
+    // If model data was provided, load the model from memory
+    if (model_data_it->second.empty()) {
+      throw std::runtime_error("Failed to load model data from memory for " + model_filename);
+    }
+    // TODO (baijumeswani): Loading ONNX models from memory that hold references to data stored in external files
+    // is not supported at the moment. This limitation stems from the fact that ONNX models typically
+    // reference these external files using relative paths to the model file. When loading a model from memory,
+    // the relative paths may not resolve correctly, leading to issues in locating the referenced data.
+    // To work around this, we change the current working directory to the model's config path
+    // before creating the session. This allows the model to resolve relative paths correctly.
+    // Note that this is not a problem for models that do not reference external files.
+    // This is a temporary solution and can be potentially addressed by exposing means to set a working directory
+    // for the OrtSession through the ONNX Runtime API.
+    // This solution is not ideal since it modifies the global state of the process, and is hence not thread-safe.
+    DirGuard dir_guard;
+    dir_guard.ChangeTo(config_->config_path);
+    auto session = OrtSession::Create(ort_env, model_data_it->second.data(), model_data_it->second.size(), session_options);
+
+    return session;
+  }
+
+  // Otherwise, load the model from the file system
+  return OrtSession::Create(ort_env, (config_->config_path / fs::path(model_filename)).c_str(), session_options);
+}
+
 std::shared_ptr<Tokenizer> Model::CreateTokenizer() const {
   return std::make_shared<Tokenizer>(*config_);
 }
@@ -800,23 +941,18 @@ std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, const char* config_path, con
 }
 
 std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, std::unique_ptr<Config> config) {
-  std::set<std::string> llm_types = {"chatglm", "decoder", "gemma", "gemma2", "gemma3_text",
-                                     "granite", "llama", "mistral", "nemotron", "olmo",
-                                     "phi", "phimoe", "phi3", "phi3small", "qwen2", "qwen3"};
   if (config->model.type == "gpt2")
     return std::make_shared<Gpt_Model>(std::move(config), ort_env);
-  if (llm_types.find(config->model.type) != llm_types.end())
+  if (ModelType::IsLLM(config->model.type))
     return std::make_shared<DecoderOnly_Model>(std::move(config), ort_env);
-  if (config->model.type == "whisper")
-    return std::make_shared<Whisper_Model>(std::move(config), ort_env);
-  if (config->model.type == "phi3v")
+  if (ModelType::IsALM(config->model.type))
+    return std::make_shared<WhisperModel>(std::move(config), ort_env);
+  if (ModelType::IsVLM(config->model.type))
     return std::make_shared<MultiModalLanguageModel>(std::move(config), ort_env, true, false);
-  if (config->model.type == "decoder-pipeline")
+  if (ModelType::IsPipe(config->model.type))
     return std::make_shared<DecoderOnlyPipelineModel>(std::move(config), ort_env);
-  if (config->model.type == "phi4mm")
+  if (ModelType::IsMMM(config->model.type))
     return std::make_shared<MultiModalLanguageModel>(std::move(config), ort_env, true, true);
-  if (config->model.type == "gemma3")
-    return std::make_shared<MultiModalLanguageModel>(std::move(config), ort_env, true, false);
   if (config->model.type == "marian-ssru")
     return std::make_shared<MarianModel>(std::move(config), ort_env);
 
@@ -872,7 +1008,7 @@ std::unique_ptr<OrtValue> Model::ExpandInputs(std::unique_ptr<OrtValue>& input, 
   auto element_type = input_type_info->GetElementType();
   auto input_shape = input_type_info->GetShape();
   const int64_t batch_size = input_shape[0];
-  const int64_t data_size_bytes = input_type_info->GetElementCount() * SizeOf(element_type) / batch_size;
+  const int64_t data_size_bytes = input_type_info->GetElementCount() * Ort::SizeOf(element_type) / batch_size;
 
   input_shape[0] *= num_beams;
 
@@ -910,7 +1046,13 @@ MultiModalProcessor::MultiModalProcessor(Config& config, const SessionInfo& sess
 }
 
 std::unique_ptr<NamedTensors> MultiModalProcessor::Process(const std::string& prompt, const Images* images, const Audios* audios) const {
-  Payload payload{prompt, images, audios};
+  Payload payload{prompt, {}, images, audios};
   return processor_->Process(*tokenizer_, payload);
 }
+
+std::unique_ptr<NamedTensors> MultiModalProcessor::Process(std::span<const char*> prompts, const Images* images, const Audios* audios) const {
+  Payload payload{"", prompts, images, audios};
+  return processor_->Process(*tokenizer_, payload);
+}
+
 }  // namespace Generators

@@ -374,10 +374,26 @@ class Model:
         self.past_present_share_buffer = self.attention_attrs["op_type"] == "GroupQueryAttention"
 
     def make_genai_config(self, model_name_or_path, extra_kwargs, out_dir):
+        # Create config with attributes from config.json and generation_config.json (if latter file exists)
+        config = AutoConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
         try:
-            config = GenerationConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
+            # Override search attributes in config based on values in generation_config.json
+            gen_config = GenerationConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
+            defaults = {
+                "bos_token_id": None,
+                "do_sample": False,
+                "eos_token_id": None,
+                "pad_token_id": None,
+                "temperature": 1.0,
+                "top_k": 50,
+                "top_p": 1.0,
+            }
+            for key, default_val in defaults.items():
+                val = getattr(gen_config, key)
+                if val != default_val:
+                    setattr(config, key, getattr(gen_config, key))
         except:
-            config = AutoConfig.from_pretrained(model_name_or_path, token=self.hf_token, trust_remote_code=True, **extra_kwargs)
+            pass
 
         inputs = dict(zip(self.input_names, self.input_names))
         inputs.update({
@@ -393,9 +409,12 @@ class Model:
             # Remove 'hidden_states' from 'outputs' entry in config since ORT GenAI doesn't use it
             del outputs["hidden_states"]
 
+        bos_token_id = config.bos_token_id if hasattr(config, "bos_token_id") and config.bos_token_id is not None else 1
+        eos_token_id = config.eos_token_id
+        pad_token_id = config.pad_token_id if hasattr(config, "pad_token_id") and config.pad_token_id is not None else config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
         genai_config = {
             "model": {
-                "bos_token_id": config.bos_token_id if hasattr(config, "bos_token_id") and config.bos_token_id is not None else 1,  # config.bos_token_id not present in ChatGLM model configs.
+                "bos_token_id": bos_token_id,
                 "context_length": self.context_length,
                 "decoder": {
                     "session_options" : {
@@ -411,8 +430,8 @@ class Model:
                     "num_hidden_layers": self.num_layers,
                     "num_key_value_heads": self.num_kv_heads,
                 },
-                "eos_token_id": config.eos_token_id,
-                "pad_token_id": config.pad_token_id if hasattr(config, "pad_token_id") and config.pad_token_id is not None else config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id,
+                "eos_token_id": eos_token_id,
+                "pad_token_id": pad_token_id,
                 "type": self.model_type[ : self.model_type.find("For") if "For" in self.model_type else len(self.model_type)].lower(),
                 "vocab_size": self.vocab_size,
             },
@@ -2713,31 +2732,27 @@ class Model:
     def has_final_norm(self, module, orig_model):
         # Find where the language model is stored to check attributes. Some classes
         # store the language model in a different attribute than `model.model`.
-        if hasattr(orig_model, "language_model"):
-            # Model is multimodal
-            # Note: This case is checked first because the `language_model` attribute and the `base_model` attribute
-            # exist for both multimodal models and PEFT models. However they represent different classes and their attributes
-            # differ.
-            model = orig_model.language_model
-        elif hasattr(orig_model, "base_model") and hasattr(orig_model.base_model, "model"):
-            if hasattr(orig_model.base_model.model, "model"):
-                # Model is from PEFT
-                model = orig_model.base_model.model
-            else:
-                # Model is text-based only.
-                model = orig_model.base_model
+        if orig_model.__class__.__name__.startswith("Peft"):
+            # Model is from PEFT
+            model = orig_model.base_model.model
         else:
             model = orig_model
 
-        # Hugging Face names
+        # Hugging Face names (all models loaded with AutoModelForCausalLM.from_pretrained)
+        #
+        # hf_norm:                        for most models
+        # hf_final_layernorm:             for Phi-2
+        # hf_transformer_final_layernorm: for ChatGLM-3
+        # hf_language_model_norm:         for Gemma-3 multimodal (4B, 12B, 27B)
         hf_norm = hasattr(model, "model") and hasattr(model.model, "norm") and module == model.model.norm
         hf_final_layernorm = hasattr(model, "model") and hasattr(model.model, "final_layernorm") and module == model.model.final_layernorm
         hf_transformer_final_layernorm = hasattr(model, "transformer") and hasattr(model.transformer, "encoder") and hasattr(model.transformer.encoder, "final_layernorm") and module == model.transformer.encoder.final_layernorm
+        hf_language_model_norm = hasattr(model, "model") and hasattr(model.model, "language_model") and hasattr(model.model.language_model, "norm") and module == model.model.language_model.norm
 
-        # GGUF names
+        # GGUF names (all models loaded with GGUFModel.from_pretrained)
         gguf_final_norm = hasattr(model, "final_norm") and module == model.final_norm
 
-        hf_names = [hf_norm, hf_final_layernorm, hf_transformer_final_layernorm]
+        hf_names = [hf_norm, hf_final_layernorm, hf_transformer_final_layernorm, hf_language_model_norm]
         gguf_names = [gguf_final_norm]
         return any(hf_names + gguf_names)
 
@@ -3264,7 +3279,7 @@ class Gemma2Model(GemmaModel):
         super().make_layernorm(layer_id, layernorm, skip, simple, location)
 
     def make_layer(self, layer_id, layer):
-        # Gemma2 decoder layer is typically defined as:
+        # Gemma-2 decoder layer is typically defined as:
         # input_layernorm --> attention --> post_attention_layernorm --> pre_ffn_layernorm --> MLP --> post_ffn_layernorm
 
         # Adjust LayerNorm attributes because of extra LayerNorms inserted
@@ -3713,7 +3728,7 @@ class Phi4MMModel(Phi3VModel):
 class Gemma3Model(Gemma2Model):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
-        self.is_local = lambda layer_id: bool((layer_id + 1) % config.sliding_window_pattern)
+        self.is_local = lambda layer_id: bool((layer_id + 1) % 6)
         self.rope_local_theta = config.rope_local_base_freq
         self.make_rotary_embedding_multi_cache()
 
@@ -4185,10 +4200,6 @@ def check_extra_options(kv_pairs):
         # 'include_hidden_states' is for when 'hidden_states' are outputted and 'logits' are outputted
         raise ValueError("Both 'exclude_lm_head' and 'include_hidden_states' cannot be used together. Please use only one of them at once.")
 
-    # NvTensorRtRtx EP requires Opset 21, so force use_qdq which controls it.
-    if args.execution_provider == "NvTensorRtRtx":
-        kv_pairs["use_qdq"] = True
-
 
 def parse_extra_options(kv_items):
     """
@@ -4276,6 +4287,7 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
         # List architecture options in alphabetical order
         if config.architectures[0] == "ChatGLMForConditionalGeneration" or config.architectures[0] == "ChatGLMModel":
             # Quantized ChatGLM model has ChatGLMForConditionalGeneration as architecture whereas HF model as the latter
+            config.bos_token_id = 1
             config.hidden_act = "swiglu"
             onnx_model = ChatGLMModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Ernie4_5_ForCausalLM":

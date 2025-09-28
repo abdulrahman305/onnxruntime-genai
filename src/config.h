@@ -64,9 +64,16 @@ struct Config {
   fs::path config_path;  // Path of the config directory
 
   using NamedString = std::pair<std::string, std::string>;
+  struct DeviceFilteringOptions {
+    std::optional<OrtHardwareDeviceType> hardware_device_type;  // OrtHardwareDeviceType_CPU, OrtHardwareDeviceType_GPU, OrtHardwareDeviceType_NPU
+    std::optional<uint32_t> hardware_device_id;
+    std::optional<uint32_t> hardware_vendor_id;
+  };
+
   struct ProviderOptions {
     std::string name;
     std::vector<NamedString> options;
+    std::optional<DeviceFilteringOptions> device_filtering_options;
   };
 
   struct SessionOptions {
@@ -237,6 +244,7 @@ struct Config {
         std::unordered_map<std::string, std::string> output_names_forwarder;
         bool run_on_prompt{true};
         bool run_on_token_gen{true};
+        bool is_lm_head{false};
         int reset_session_idx{-1};  // Some models cannot keep all the ort sessions in memory at once due to memory constraints.
                                     // This is the index of the session that needs to be reset during the execution of the current session.
                                     // This is a temporary solution until the QNN driver updates are available.
@@ -268,6 +276,21 @@ struct Config {
     int random_seed{-1};               // -1 = Seed with random device, otherwise use value to seed RNG
   } search;
 
+  struct Engine {
+    struct DynamicBatching {
+      size_t block_size{256};                       // Total number of slots per block.
+      std::optional<size_t> num_blocks;             // Total number of blocks per layer.
+      std::optional<float> gpu_utilization_factor;  // Fraction of free GPU memory to use for key-value cache.
+      size_t max_batch_size{16};                    // Maximum batch size for dynamically batching requests.
+    };
+    std::optional<DynamicBatching> dynamic_batching;  // Dynamic batching settings
+
+    struct StaticBatching {
+      size_t max_batch_size{4};  // Maximum batch size for static batching
+    };
+    std::optional<StaticBatching> static_batching;  // Static batching settings
+  } engine;                                         // Engine settings
+
   void AddMapping(const std::string& nominal_name, const std::string& graph_name);
   // Returns graph name and true if the nominal name is found in the mapping
   // otherwise returns the nominal name and false
@@ -284,5 +307,12 @@ void SetProviderOption(Config& config, std::string_view provider_name, std::stri
 void OverlayConfig(Config& config, std::string_view json);
 bool IsGraphCaptureEnabled(const Config::SessionOptions& session_options);
 bool IsMultiProfileEnabled(const Config::SessionOptions& session_options);
+
+void SetDecoderProviderOptionsHardwareDeviceType(Config& config, std::string_view provider_name, std::string_view hardware_device_type);
+void SetDecoderProviderOptionsHardwareDeviceId(Config& config, std::string_view provider_name, uint32_t hardware_device_id);
+void SetDecoderProviderOptionsHardwareVendorId(Config& config, std::string_view provider_name, uint32_t hardware_vendor_id);
+void ClearDecoderProviderOptionsHardwareDeviceType(Config& config, std::string_view provider_name);
+void ClearDecoderProviderOptionsHardwareDeviceId(Config& config, std::string_view provider_name);
+void ClearDecoderProviderOptionsHardwareVendorId(Config& config, std::string_view provider_name);
 
 }  // namespace Generators

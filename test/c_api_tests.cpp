@@ -186,29 +186,30 @@ TEST(CAPITests, ChatTemplate) {
   // We load the phi-2 model just to get a tokenizer (phi-2 does not have a chat template)
   auto tokenizer = OgaTokenizer::Create(*OgaModel::Create(PHI2_PATH));
 
-  // Testing phi-4 chat template
+  // Testing phi-4-mini chat template
   const char* messages_json = R"(
     [
       {
         "role": "system",
-        "content": "You are a helpful assistant.",
-        "tools": "Calculator"
+        "content": "System message",
+        "tools": "[{\"name\": \"calculate_sum\", \"description\": \"Calculate the sum of two numbers.\", \"parameters\": {\"a\": {\"type\": \"int\"}, \"b\": {\"type\": \"int\"}}}]"
       },
       {
         "role": "user",
-        "content": "How do I add two numbers?"
+        "content": "Hello, can you call some tools for me?"
       },
       {
         "role": "assistant",
-        "content": "You can add numbers by using the '+' operator."
+        "content": "Sure, I can calculate the sum for you!"
       }
     ])";
+
   const char* chat_template = R"({% for message in messages %}{% if message['role'] == 'system' and 'tools' in message and message['tools'] is not none %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|tool|>' + message['tools'] + '<|/tool|>' + '<|end|>' }}{% else %}{{ '<|' + message['role'] + '|>' + message['content'] + '<|end|>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>' }}{% else %}{{ eos_token }}{% endif %})";
 
-  // From HuggingFace Python output for 'microsoft/Phi-4-multimodal-instruct'
+  // From HuggingFace Python output for 'microsoft/Phi-4-mini-instruct'
   const char* expected_output =
-      "<|system|>You are a helpful assistant.<|tool|>Calculator<|/tool|><|end|><|user|>"
-      "How do I add two numbers?<|end|><|assistant|>You can add numbers by using the '+' operator.<|end|><|assistant|>";
+      "<|system|>System message<|tool|>[{\"name\": \"calculate_sum\", \"description\": \"Calculate the sum of two numbers.\", \"parameters\": {\"a\": {\"type\": \"int\"}, \"b\": {\"type\": \"int\"}}}]<|/tool|><|end|><|user|>"
+      "Hello, can you call some tools for me?<|end|><|assistant|>Sure, I can calculate the sum for you!<|end|><|assistant|>";
 
   auto out_string = tokenizer->ApplyChatTemplate(chat_template, messages_json, nullptr, true);
   ASSERT_STREQ(expected_output, out_string);
@@ -337,8 +338,11 @@ TEST(CAPITests, EndToEndPhiBatch) {
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokenSequences(*input_sequences);
 
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Decode The Batch
@@ -515,8 +519,11 @@ TEST(CAPITests, EndToEndPhi) {
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokenSequences(*input_sequence);
 
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Decode The Batch
@@ -554,8 +561,11 @@ TEST(CAPITests, EndToEndPhiEOSPAD) {
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokenSequences(*input_sequence);
 
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Decode The Batch
@@ -648,8 +658,11 @@ TEST(CAPITests, LoadModelFromMemory) {
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokenSequences(*input_sequence);
 
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Decode The Batch
@@ -725,8 +738,11 @@ TEST(CAPITests, GreedySearchGptFp32CAPI) {
 
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokens(input_ids.data(), input_ids.size());
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -887,8 +903,11 @@ TEST(CAPITests, SetTerminate) {
 
   auto GenerateOutput = [](OgaGenerator* generator, std::unique_ptr<OgaTokenizerStream> tokenizer_stream) {
     EXPECT_THROW({
-      while (!generator->IsDone()) {
+      while (true) {
         generator->GenerateNextToken();
+        if (generator->IsDone()) {
+          break;
+        }
       } }, std::runtime_error);
   };
 
@@ -949,8 +968,11 @@ struct Phi2Test {
       auto generator = OgaGenerator::Create(*model_, *params_);
       generator->AppendTokenSequences(*input_sequences_);
 
-      while (!generator->IsDone()) {
+      while (true) {
         generator->GenerateNextToken();
+        if (generator->IsDone()) {
+          break;
+        }
       }
 
       // Decode One at a time
@@ -1108,8 +1130,11 @@ TEST(CAPITests, AdaptersTest) {
     auto generator = OgaGenerator::Create(*model, *params);
     generator->AppendTokenSequences(*input_sequences);
 
-    while (!generator->IsDone()) {
+    while (true) {
       generator->GenerateNextToken();
+      if (generator->IsDone()) {
+        break;
+      }
     }
 
     auto logits = generator->GetOutput("logits");
@@ -1131,8 +1156,11 @@ TEST(CAPITests, AdaptersTest) {
     generator->SetActiveAdapter(*adapters, "adapters_a_and_b");
     generator->AppendTokenSequences(*input_sequences);
 
-    while (!generator->IsDone()) {
+    while (true) {
       generator->GenerateNextToken();
+      if (generator->IsDone()) {
+        break;
+      }
     }
 
     auto logits = generator->GetOutput("logits");
@@ -1182,8 +1210,11 @@ TEST(CAPITests, AdaptersTestMultipleAdapters) {
     generator->SetActiveAdapter(*adapters, "adapter_b");
     generator->AppendTokenSequences(*input_sequences);
 
-    while (!generator->IsDone()) {
+    while (true) {
       generator->GenerateNextToken();
+      if (generator->IsDone()) {
+        break;
+      }
     }
   }
 
@@ -1225,8 +1256,11 @@ TEST(CAPITests, BatchedRewindGptFp32CAPI) {
 
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokens(input_ids.data(), input_ids.size());
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -1244,8 +1278,11 @@ TEST(CAPITests, BatchedRewindGptFp32CAPI) {
   generator->RewindTo(0);
 
   generator->AppendTokens(input_ids.data(), input_ids.size());
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -1279,8 +1316,11 @@ TEST(CAPITests, RewindGptFp32CAPI) {
 
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokens(input_ids.data(), input_ids.size());
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -1294,8 +1334,11 @@ TEST(CAPITests, RewindGptFp32CAPI) {
   // Rewind to length 5 and verify same output
   generator->RewindTo(5);
 
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -1310,8 +1353,11 @@ TEST(CAPITests, RewindGptFp32CAPI) {
 
   std::vector<int32_t> next_ids{731, 731};
   generator->AppendTokens(next_ids.data(), next_ids.size());
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
 
   // Verify outputs match expected outputs
@@ -1336,12 +1382,15 @@ TEST(CAPITests, SetGuidance) {
   tokenizer->Encode(input_string, *input_sequences);
   auto params = OgaGeneratorParams::Create(*model);
   params->SetSearchOption("max_length", 32);
-  params->SetGuidance("regex", "answer: .*");
+  params->SetGuidance("regex", "answer: .*", false);
 
   auto generator = OgaGenerator::Create(*model, *params);
   generator->AppendTokenSequences(*input_sequences);
-  while (!generator->IsDone()) {
+  while (true) {
     generator->GenerateNextToken();
+    if (generator->IsDone()) {
+      break;
+    }
   }
   auto out_string = tokenizer->Decode(generator->GetSequenceData(0), generator->GetSequenceCount(0));
   auto output = std::string(out_string).substr(std::string(input_string).size());
